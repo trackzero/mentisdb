@@ -11,6 +11,7 @@ use mentisdb::{
     ThoughtType,
 };
 use tempfile::tempdir;
+use uuid::Uuid;
 
 fn open_chain(dir: &std::path::Path, key: &str) -> MentisDb {
     MentisDb::open_with_key_and_storage_kind(dir, key, StorageAdapterKind::Binary).unwrap()
@@ -334,4 +335,99 @@ fn chain_integrity_holds_after_a_dream_pass() {
     run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
 
     assert!(chain.verify_integrity());
+}
+
+// ---------------------------------------------------------------------
+// Phase 1: combined budget, real-write integrity, decay-phase no-op
+// ---------------------------------------------------------------------
+
+#[test]
+fn max_writes_per_pass_caps_combined_consolidation_and_dedup_writes() {
+    let dir = tempdir().unwrap();
+    let mut chain = open_chain(dir.path(), "combined-budget");
+    // Five separate session-grouped windows, each independently
+    // consolidatable, comfortably exceeding a budget of 2.
+    for session in 0..5 {
+        let session_id = Uuid::new_v4();
+        for i in 0..2 {
+            chain
+                .append_thought(
+                    "agent",
+                    ThoughtInput::new(
+                        ThoughtType::Finding,
+                        format!("session {session} finding {i}"),
+                    )
+                    .with_session_id(session_id)
+                    .with_importance(0.7),
+                )
+                .unwrap();
+        }
+    }
+
+    let config = DreamConfig {
+        max_writes_per_pass: 2,
+        ..DreamConfig::default()
+    };
+    let report = run_dream_pass(&mut chain, &config, false, &[]).unwrap();
+
+    let total_writes = report.counts.consolidations + report.counts.suggestions;
+    assert!(
+        total_writes <= 2,
+        "expected at most 2 combined writes, got {total_writes}"
+    );
+}
+
+#[test]
+fn chain_integrity_holds_after_a_pass_with_real_consolidation_writes() {
+    let dir = tempdir().unwrap();
+    let mut chain = open_chain(dir.path(), "integrity-with-writes");
+    let session = Uuid::new_v4();
+    for i in 0..3 {
+        chain
+            .append_thought(
+                "agent",
+                ThoughtInput::new(ThoughtType::Finding, format!("integrity finding {i}"))
+                    .with_session_id(session)
+                    .with_importance(0.7),
+            )
+            .unwrap();
+    }
+
+    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    assert!(
+        report.counts.consolidations > 0,
+        "expected at least one consolidation to exercise integrity"
+    );
+
+    assert!(chain.verify_integrity());
+}
+
+#[test]
+fn phases_decay_only_performs_watermark_bookkeeping() {
+    let dir = tempdir().unwrap();
+    let mut chain = open_chain(dir.path(), "decay-phase-noop");
+    let session = Uuid::new_v4();
+    for i in 0..2 {
+        chain
+            .append_thought(
+                "agent",
+                ThoughtInput::new(ThoughtType::Finding, format!("decay-phase finding {i}"))
+                    .with_session_id(session)
+                    .with_importance(0.7),
+            )
+            .unwrap();
+    }
+
+    let before_len = chain.thoughts().len();
+    let report = run_dream_pass(
+        &mut chain,
+        &DreamConfig::default(),
+        false,
+        &["decay".to_string()],
+    )
+    .unwrap();
+
+    assert_eq!(report.counts, DreamPassCounts::default());
+    // Only the report thought is appended: no consolidation/dedup ran.
+    assert_eq!(chain.thoughts().len(), before_len + 1);
 }

@@ -2106,13 +2106,10 @@ and MCP `thought_type` fields use the same parser.
 ## Dreaming
 
 MentisDB can run an offline, idle-time consolidation pass ("dreaming") over
-stored memory. It is **off by default** and, in this release, is pure
-scaffolding: it registers a `mentis-dreamer` agent, resumes from a
-watermarked scan window, and appends a report — no consolidation, decay, or
-recombination logic exists yet. Later releases will add those on top of this
-foundation. See [docs/dreaming-design.md](docs/dreaming-design.md) for the
-full design and its non-negotiables (append-only, no-LLM core, provenance on
-every write, suggest-don't-act, off by default).
+stored memory. It is **off by default**. See
+[docs/dreaming-design.md](docs/dreaming-design.md) for the full design and
+its non-negotiables (append-only, no-LLM core, provenance on every write,
+suggest-don't-act, off by default).
 
 - Manual trigger: `mentisdb_dream` (MCP), `POST /v1/dream` (REST), or
   `mentisdb dream [--chain <key>] [--dry-run] [--phase <phase,...>]` (CLI).
@@ -2125,6 +2122,31 @@ every write, suggest-don't-act, off by default).
   `ThoughtQuery` / `RankedSearchQuery` / `recent_context`) opts into seeing
   them; they're excluded from `recent_context`, ranked search, and
   `memory_markdown` by default.
+- **Extractive consolidation**: each pass ranks uncovered
+  `build_summary_candidates` windows by a salience score (importance × recency
+  × in-degree × type boost) and appends one `Summary`/`Dream` digest per
+  top-ranked window, tagged `dream:consolidation`, with one `Summarizes`
+  relation per source thought. Dream-role and invalidated thoughts are never
+  sampled or consolidated.
+- **Dedup suggestions**: within the same pass, near-duplicate pairs from the
+  *same agent* (cosine ≥ 0.95 on a configured vector sidecar **and** ≥ 0.5
+  lexical overlap, not already linked) get one `Finding`/`Dream` thought
+  tagged `dream:suggestion`, with `RelatedTo` links to both — never
+  `Supersedes`/`Invalidates`/`Corrects`. Treat these as unconfirmed proposals,
+  not settled facts. Both operations share `DreamConfig.max_writes_per_pass`
+  as a combined budget per pass.
+- **Query-time decay**: `RankedSearchQuery::use_decay` (default `false`)
+  multiplies each hit's score by an exponential decay curve keyed on a
+  per-`ThoughtType`/role half-life table (Long ≈ 365d for `Constraint`,
+  `Decision`, `UserTrait`, `PreferenceUpdate`, `LessonLearned`; Short ≈ 7d for
+  the `WorkingMemory` role, `Checkpoint`, `StateSnapshot`; Medium ≈ 90d for
+  everything else, including `Finding`/`FactLearned`/`Insight`), floored so
+  nothing decays to exactly zero. A thought's age is refreshed by its newest
+  inbound reference or relation, so being consolidated or cited keeps it
+  "alive." Override any type's half-life via
+  `DreamConfig.half_life_overrides_days`. `use_decay` only affects ranked
+  search — `query()`/`recent_context`/`memory_markdown` are unaffected, and
+  search-eval benchmarks are unchanged with it off (the default).
 
 ### Memory Scopes
 

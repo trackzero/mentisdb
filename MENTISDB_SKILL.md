@@ -124,6 +124,8 @@ Most resumable notes should be `Summary` with `role: Checkpoint`.
 
 **Don't write `role: Dream` yourself.** It's reserved for offline consolidation passes (see `docs/dreaming-design.md`) — content written by an agent should stay `role: Memory` (or another role above). Dream-role thoughts are excluded from `recent_context`, ranked search, and `memory_markdown` by default; pass `include_dreams=true` to review them, or trigger a manual pass with `mentisdb_dream`.
 
+**Treat `dream:suggestion`-tagged `Finding` thoughts as unconfirmed proposals, not settled facts.** A dream pass only ever suggests — a suggestion that thought A likely supersedes thought B is linked with `RelatedTo`, never `Supersedes`/`Invalidates`/`Corrects`. Don't chain further reasoning off one without independently verifying it or explicitly promoting it (appending a normal thought with `DerivedFrom` to confirm, or `Invalidates` to dismiss).
+
 ## 🔗 THOUGHT GRAPH
 
 Link via `refs: [index]` (intra-chain) or typed `relations` with `kind` and `target_id`:

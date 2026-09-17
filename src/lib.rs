@@ -3427,6 +3427,16 @@ pub struct RankedSearchQuery {
     /// and are identifiable via [`RankedSearchHit::thought`]'s
     /// [`Thought::role`].
     pub include_dreams: bool,
+    /// When `true`, multiply each hit's score by a query-time decay factor
+    /// derived from [`crate::dream::salience::effective_importance`]'s
+    /// exponential decay curve (per-type half-life, floored so nothing is
+    /// driven to exactly zero).
+    ///
+    /// Defaults to `false`: with it off, ranking is byte-identical to a
+    /// build with no decay support at all. Applied before the
+    /// [`Self::include_dreams`] down-weighting, so dream-weight remains the
+    /// final adjustment on a hit's score.
+    pub use_decay: bool,
     /// Optional memory scope filter.
     ///
     /// When set, only thoughts tagged with the matching `scope:{variant}` tag
@@ -3581,6 +3591,20 @@ impl RankedSearchQuery {
         self
     }
 
+    /// Enable query-time decay on this query's results.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use mentisdb::RankedSearchQuery;
+    /// let query = RankedSearchQuery::new().with_use_decay(true);
+    /// assert!(query.use_decay);
+    /// ```
+    pub fn with_use_decay(mut self, use_decay: bool) -> Self {
+        self.use_decay = use_decay;
+        self
+    }
+
     /// Filter results to a specific memory scope.
     ///
     /// This adds a `scope:{variant}` tag to the underlying filter's
@@ -3637,6 +3661,7 @@ impl Default for RankedSearchQuery {
             as_of: None,
             include_invalidated: false,
             include_dreams: false,
+            use_decay: false,
             scope: None,
             enable_reranking: false,
             rerank_k: 50,
@@ -6296,6 +6321,33 @@ impl MentisDb {
                         + hit.score.session_cohesion;
                     hit.score.total = rrf_f32 + additive;
                 }
+            }
+        }
+
+        // Query-time decay (off by default): multiply each hit's score by an
+        // exponential decay ratio derived from its effective age and
+        // per-type half-life. Applied before the dream-weight block below so
+        // dream-weight remains the final adjustment on a hit's score.
+        if request.use_decay {
+            let adjacency = self.cached_adjacency_index();
+            let now = Utc::now();
+            for hit in &mut hits {
+                let locator = crate::search::ThoughtLocator::local(hit.thought);
+                let effective_ts = crate::dream::salience::effective_timestamp(
+                    hit.thought,
+                    &locator,
+                    &adjacency,
+                    &self.thoughts,
+                );
+                let age_days = (now - effective_ts).num_seconds().max(0) as f32 / 86400.0;
+                let half_life = crate::dream::salience::resolve_half_life_days(
+                    hit.thought.role,
+                    hit.thought.thought_type,
+                    &self.dream_config.half_life_overrides_days,
+                );
+                let decay = crate::dream::salience::decay_ratio(age_days, half_life)
+                    .max(crate::dream::salience::DECAY_FLOOR);
+                hit.score.total *= decay;
             }
         }
 

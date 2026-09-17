@@ -12,6 +12,10 @@
 //! intact, every dream write carries provenance, a pass only ever suggests,
 //! and everything is off by default.
 
+mod consolidate;
+pub mod salience;
+mod suggest;
+
 #[cfg(feature = "server")]
 pub mod scheduler;
 
@@ -88,7 +92,17 @@ pub struct DreamConfig {
     /// Maximum number of LLM recombination calls per pass (Phase 2).
     pub recombination_budget: usize,
     /// Optional seed for deterministic sampling in later phases.
+    ///
+    /// Not exercised in Phase 1: extractive consolidation and dedup
+    /// suggestions are a deterministic sort by salience, not a probabilistic
+    /// sample. Reserved for Phase 2's LLM-based recombination sampling.
     pub seed: Option<u64>,
+    /// Per-[`crate::ThoughtType`] overrides for the query-time decay half-life
+    /// table in [`salience::half_life_days`].
+    ///
+    /// Defaults to empty, which uses the built-in table unmodified.
+    #[serde(default)]
+    pub half_life_overrides_days: std::collections::HashMap<crate::ThoughtType, u32>,
 }
 
 impl Default for DreamConfig {
@@ -104,6 +118,7 @@ impl Default for DreamConfig {
             llm: None,
             recombination_budget: 3,
             seed: None,
+            half_life_overrides_days: std::collections::HashMap::new(),
         }
     }
 }
@@ -141,6 +156,7 @@ impl DreamConfig {
             },
             recombination_budget: defaults.recombination_budget,
             seed: defaults.seed,
+            half_life_overrides_days: defaults.half_life_overrides_days,
         }
     }
 }
@@ -295,6 +311,7 @@ pub fn run_dream_pass(
         None,
     )?;
 
+    let pass_id = Uuid::new_v4();
     let scan_end_index = db.thoughts().len() as u64;
     let scan_start_index = match latest_report(db) {
         Some(prior) => prior.high_water_index.min(scan_end_index),
@@ -302,8 +319,39 @@ pub fn run_dream_pass(
     };
     let scanned_count = scan_end_index.saturating_sub(scan_start_index);
 
+    // "consolidate" bundles both extractive consolidation and dedup
+    // suggestions — the design and kickoff describe Phase 1 as one coherent
+    // no-LLM unit, and `DREAM_PHASE_NAMES` has no separate name for dedup.
+    // "decay" is a documented no-op here: decay is a query-time ranked-search
+    // factor (`RankedSearchQuery::use_decay`), not a pass-time operation, so
+    // naming it in `phases` has no effect on what a pass writes.
+    let run_consolidate = phases.is_empty() || phases.iter().any(|p| p == "consolidate");
+
+    let mut remaining_budget = config.max_writes_per_pass;
+    let mut consolidations = Vec::new();
+    let mut suggestions = Vec::new();
+    if run_consolidate {
+        consolidations = consolidate::plan_consolidations(
+            db,
+            config,
+            scan_start_index,
+            scan_end_index,
+            pass_id,
+            remaining_budget,
+        );
+        remaining_budget = remaining_budget.saturating_sub(consolidations.len());
+        suggestions = suggest::plan_dedup_suggestions(
+            db,
+            config,
+            scan_start_index,
+            scan_end_index,
+            pass_id,
+            remaining_budget,
+        );
+    }
+
     let mut report = DreamReport {
-        pass_id: Uuid::new_v4(),
+        pass_id,
         chain_key,
         started_at,
         duration_ms: 0,
@@ -313,7 +361,11 @@ pub fn run_dream_pass(
         high_water_index: scan_end_index,
         scanned_count,
         llm_tokens_used: 0,
-        counts: DreamPassCounts::default(),
+        counts: DreamPassCounts {
+            consolidations: consolidations.len() as u64,
+            suggestions: suggestions.len() as u64,
+            ..DreamPassCounts::default()
+        },
         phases: phases.to_vec(),
     };
 
@@ -322,11 +374,18 @@ pub fn run_dream_pass(
         return Ok(report);
     }
 
-    // This pass is about to append exactly one thought (its own report).
-    // Advance the watermark past it so the next pass's scan window doesn't
-    // re-count it as new activity — otherwise a chain with no other appends
-    // between passes would never see a truly empty window.
-    report.high_water_index = scan_end_index + 1;
+    for input in consolidations.into_iter().chain(suggestions) {
+        db.append_thought(DREAM_AGENT_ID, input)?;
+    }
+
+    // This pass is about to append its own report thought, plus whatever
+    // consolidation/suggestion thoughts it just wrote above. Advance the
+    // watermark past all of them so the next pass's scan window doesn't
+    // re-count them as new activity to consolidate — otherwise a chain with
+    // no other appends between passes would never see a truly empty window,
+    // and dreams could end up "consolidating" their own prior output.
+    report.high_water_index =
+        scan_end_index + 1 + report.counts.consolidations + report.counts.suggestions;
     report.duration_ms = started_instant.elapsed().as_millis() as u64;
     let content = serde_json::to_string(&report)
         .map_err(|e| io::Error::other(format!("failed to serialize dream report: {e}")))?;

@@ -1,4 +1,34 @@
-0.10.8.54 SEP/17/2026 (feature/dreaming, Phase 0 — not yet released)
+0.10.8.54 SEP/17/2026 (feature/dreaming, Phase 0+1 — not yet released)
+  - feat(dreaming): Phase 1 — salience sampler, extractive consolidation,
+    query-time decay, and dedup suggestions on top of Phase 0's scaffolding.
+    Off by default; still no LLM dependency. See docs/dreaming-design.md.
+    - `mentisdb::dream::salience`: a within-pass salience formula
+      (importance x recency x in-degree x type boost) and a per-type/role
+      query-time decay half-life table (Long ~365d, Medium ~90d default,
+      Short ~7d), overridable via `DreamConfig::half_life_overrides_days`.
+    - Extractive consolidation: each pass ranks uncovered
+      `build_summary_candidates` windows (2+ members) by summed salience and
+      appends one `Summary`/`Dream` digest per top window within budget, with
+      one `Summarizes` relation per source thought. Dream-role and
+      invalidated thoughts are never sampled or consolidated.
+    - Dedup suggestions: same-agent pairs with vector cosine >= 0.95 and
+      lexical (Jaccard) overlap >= 0.5, not already linked, get one
+      `Finding`/`Dream` thought tagged `dream:suggestion` with `RelatedTo`
+      links to both. Never `Supersedes`/`Invalidates`/`Corrects`. Skipped
+      cleanly (zero suggestions, no error) when no vector sidecar is
+      configured for the chain.
+    - Consolidation and dedup share `DreamConfig::max_writes_per_pass` as one
+      combined per-pass write budget.
+    - `RankedSearchQuery::use_decay` (default false): multiplies ranked
+      search scores by the decay curve above, applied before the existing
+      dream-weight down-weighting. Ranked-search only; `query()`,
+      `recent_context`, and `memory_markdown` are unaffected. Byte-identical
+      to `master` with it off (the default) — search-eval suites confirmed
+      unchanged.
+  - test(dreaming): new `dream_consolidation_tests`, `dream_suggest_tests`,
+    `dream_decay_tests` suites, inline unit tests for the salience/decay
+    formulas, and extended `dream_tests` coverage (combined write budget,
+    chain integrity after real writes, `--phase decay`'s documented no-op).
   - feat(dreaming): Phase 0 scaffolding for offline, idle-time consolidation
     ("dreaming"). Off by default; performs no consolidation, decay, or
     recombination yet — see docs/dreaming-design.md for the full design.
