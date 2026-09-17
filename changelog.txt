@@ -1,3 +1,34 @@
+0.10.8.54 SEP/17/2026 (feature/dreaming, Phase 0 — not yet released)
+  - feat(dreaming): Phase 0 scaffolding for offline, idle-time consolidation
+    ("dreaming"). Off by default; performs no consolidation, decay, or
+    recombination yet — see docs/dreaming-design.md for the full design.
+    - `ThoughtRole::Dream` added everywhere roles are parsed, displayed, and
+      round-tripped through MEMORY.md import/export.
+    - `include_dreams: bool` added to `ThoughtQuery` and `RankedSearchQuery`
+      (default false), following the existing `include_invalidated` pattern.
+      Dream-role thoughts are excluded from `recent_context`, ranked search,
+      and `memory_markdown` by default; included dream hits in ranked search
+      are down-weighted by `DreamConfig::dream_weight`.
+    - `mentisdb::dream::{DreamConfig, DreamReport, DreamPassCounts,
+      run_dream_pass}`: registers the `mentis-dreamer` agent, computes a
+      resumable scan window from the chain's last dream-pass report (or
+      `max(0, head - max_scan)` on the first pass), and appends an
+      `Audit`-role `StateSnapshot` report tagged `dream:report`. `dry_run`
+      appends nothing. Dream-written thoughts are not cryptographically
+      signed in this phase (no key material in scope yet).
+    - Manual trigger: `mentisdb_dream` MCP tool, `POST /v1/dream` REST
+      endpoint, and `mentisdb dream [--chain] [--dry-run] [--phase]` CLI
+      subcommand. All three share one per-chain overlap lock.
+    - Idle scheduler (`server` feature): a coarse-tick background loop that
+      runs a dream pass on configured chains once idle for
+      `idle_after_secs` and past `min_interval_secs` since the last pass.
+      Disabled unless `DreamConfig.enabled` / `MENTISDB_DREAM_ENABLED=true`.
+    - `dream.completed` webhook event, generalized alongside the existing
+      `thought.appended` event on the same delivery queue.
+  - test(dreaming): new `dream_tests`, `dream_server_tests`,
+    `dream_scheduler_tests` integration suites plus unit tests for the
+    config, watermark, and idle-detection logic.
+
 0.10.8.53 SEP/16/2026
   - fix(sidecar): keep the vector sidecar WAL chain head consistent with the
     on-disk snapshot, fixing a deterministic chain brick (GitHub issue #20).

@@ -267,6 +267,12 @@ pub struct MentisDbServiceConfig {
     pub bearer_token_access: Arc<AtomicBool>,
     /// Durable bearer-token registry used by MCP HTTP endpoints.
     pub bearer_token_store: BearerTokenStore,
+    /// Dreaming configuration applied to every chain this service opens.
+    ///
+    /// Defaults to [`DreamConfig::default`](crate::dream::DreamConfig::default)
+    /// (`enabled: false`). Controlled by `MENTISDB_DREAM_*` in the daemon; see
+    /// [`crate::dream::DreamConfig::from_env`].
+    pub dream: crate::dream::DreamConfig,
 }
 
 impl std::fmt::Debug for MentisDbServiceConfig {
@@ -293,6 +299,7 @@ impl std::fmt::Debug for MentisDbServiceConfig {
                 &self.bearer_token_access.load(Ordering::Relaxed),
             )
             .field("bearer_token_store", &self.bearer_token_store.path())
+            .field("dream", &self.dream)
             .finish()
     }
 }
@@ -343,7 +350,15 @@ impl MentisDbServiceConfig {
             dedup_scan_window: 64,
             bearer_token_access: Arc::new(AtomicBool::new(false)),
             bearer_token_store: BearerTokenStore::new(chain_dir),
+            dream: crate::dream::DreamConfig::default(),
         }
+    }
+
+    /// Set the dreaming configuration applied to every chain this service
+    /// opens.
+    pub fn with_dream_config(mut self, dream: crate::dream::DreamConfig) -> Self {
+        self.dream = dream;
+        self
     }
 
     /// Enable or disable verbose interaction logging for this service.
@@ -764,7 +779,8 @@ impl MentisDbServerConfig {
                     .unwrap_or(64)
                     .max(1),
             )
-            .with_bearer_token_access(bearer_token_access_from_env()),
+            .with_bearer_token_access(bearer_token_access_from_env())
+            .with_dream_config(crate::dream::DreamConfig::from_env()),
             mcp_addr: SocketAddr::new(bind_host, mcp_port),
             rest_addr: SocketAddr::new(bind_host, rest_port),
             https_mcp_addr,
@@ -936,6 +952,9 @@ pub struct MentisDbServerHandles {
     /// [`MentisDbServerConfig::dashboard_addr`] was `None` (i.e.
     /// `MENTISDB_DASHBOARD_PORT=0`).
     pub dashboard: Option<ServerHandle>,
+    /// Handle for the idle dream scheduler, or `None` when
+    /// [`crate::dream::DreamConfig::enabled`] was `false`.
+    pub dream_scheduler: Option<crate::dream::scheduler::DreamSchedulerHandle>,
 }
 
 /// Resolve the default on-disk MentisDB storage directory using the following
@@ -1502,12 +1521,20 @@ pub async fn start_servers(
         None
     };
 
+    let dream_scheduler = config.service.dream.enabled.then(|| {
+        crate::dream::scheduler::spawn_dream_scheduler(
+            service.clone(),
+            config.service.dream.clone(),
+        )
+    });
+
     Ok(MentisDbServerHandles {
         mcp,
         rest,
         https_mcp,
         https_rest,
         dashboard,
+        dream_scheduler,
     })
 }
 
@@ -1647,6 +1674,7 @@ fn rest_router_with_service(service: Arc<MentisDbService>) -> Router {
         .route("/v1/webhooks", post(rest_register_webhook_handler))
         .route("/v1/webhooks/{id}", delete(rest_delete_webhook_handler))
         .route("/v1/extract-memories", post(rest_extract_memories_handler))
+        .route("/v1/dream", post(rest_dream_handler))
         .with_state(service.clone())
         .layer(middleware::from_fn_with_state(
             service,
@@ -1926,6 +1954,7 @@ pub fn rest_router(config: MentisDbServiceConfig) -> Router {
         .route("/v1/webhooks", post(rest_register_webhook_handler))
         .route("/v1/webhooks/{id}", delete(rest_delete_webhook_handler))
         .route("/v1/extract-memories", post(rest_extract_memories_handler))
+        .route("/v1/dream", post(rest_dream_handler))
         .with_state(service.clone())
         .layer(middleware::from_fn_with_state(
             service,
@@ -1950,6 +1979,9 @@ pub struct MentisDbService {
     pub(crate) skills: Arc<RwLock<SkillRegistry>>,
     interaction_log: Arc<InteractionLogSink>,
     webhook_manager: WebhookManager,
+    /// Chain keys with a dream pass currently running, so a manual trigger
+    /// and the idle scheduler never run overlapping passes on one chain.
+    dream_locks: Arc<DashMap<String, ()>>,
 }
 
 #[derive(Debug)]
@@ -2377,6 +2409,7 @@ fn default_chain_mcp_tool(tool_name: &str) -> bool {
             | "mentisdb_delete_skill"
             | "mentisdb_head"
             | "mentisdb_extract_memories"
+            | "mentisdb_dream"
     )
 }
 
@@ -2597,6 +2630,9 @@ impl ToolProtocol for MentisDbMcpProtocol {
             "mentisdb_extract_memories" => {
                 parse_and_call(parameters, |request| self.service.extract_memories(request)).await
             }
+            "mentisdb_dream" => {
+                parse_and_call(parameters, |request| self.service.dream(request)).await
+            }
             _ => {
                 return Err(Box::new(ToolError::NotFound(tool_name.to_string())));
             }
@@ -2682,6 +2718,7 @@ impl MentisDbService {
             config,
             chains: Arc::new(DashMap::new()),
             webhook_manager,
+            dream_locks: Arc::new(DashMap::new()),
         }
     }
 
@@ -2711,7 +2748,7 @@ impl MentisDbService {
         Ok(thought)
     }
 
-    async fn get_chain(
+    pub(crate) async fn get_chain(
         &self,
         chain_key: Option<&str>,
         storage_adapter: Option<StorageAdapterKind>,
@@ -2739,6 +2776,7 @@ impl MentisDbService {
         let dedup_threshold = self.config.dedup_threshold;
         let dedup_scan_window = self.config.dedup_scan_window;
         let webhook_manager = self.webhook_manager.clone();
+        let dream_config = self.config.dream.clone();
         let entry = self.chains.entry(chain_key).or_try_insert_with(|| {
             MentisDb::open_with_key_and_storage_kind(&chain_dir, &chain_key_clone, storage_kind)
                 .and_then(|mut db| {
@@ -2746,6 +2784,7 @@ impl MentisDbService {
                     db.with_dedup_threshold(dedup_threshold);
                     db.with_dedup_scan_window(dedup_scan_window);
                     db.with_webhook_manager(webhook_manager);
+                    db.with_dream_config(dream_config);
                     db.apply_persisted_managed_vector_sidecars()?;
                     Ok(Arc::new(RwLock::new(db)))
                 })
@@ -3072,6 +3111,7 @@ impl MentisDbService {
             limit: None,
             entity_type: None,
             include_invalidated: None,
+            include_dreams: None,
         })?;
         let offset = request.offset.unwrap_or(0);
         let page_size = request.limit.unwrap_or(50);
@@ -3156,6 +3196,7 @@ impl MentisDbService {
                 ranked_query = ranked_query.with_reranking(k);
             }
             ranked_query = apply_include_invalidated(ranked_query, request.include_invalidated);
+            ranked_query = apply_include_dreams(ranked_query, request.include_dreams);
 
             let ranked = chain.query_ranked(&ranked_query);
             total_candidates += ranked.total_candidates;
@@ -3287,6 +3328,7 @@ impl MentisDbService {
             rerank_k: request.rerank_k,
             entity_type: request.entity_type.clone(),
             include_invalidated: request.include_invalidated,
+            include_dreams: request.include_dreams,
         };
         let filter = build_ranked_filter_query(&ranked_req, primary_chain_key.clone())?;
         let mut ranked_query = RankedSearchQuery::new()
@@ -3317,6 +3359,7 @@ impl MentisDbService {
             ranked_query = ranked_query.with_reranking(query_rerank_k.max(1));
         }
         ranked_query = apply_include_invalidated(ranked_query, request.include_invalidated);
+        ranked_query = apply_include_dreams(ranked_query, request.include_dreams);
 
         // Collect all chain arcs
         let mut chain_arcs: Vec<(String, Arc<RwLock<MentisDb>>)> = Vec::new();
@@ -3593,6 +3636,7 @@ impl MentisDbService {
             ranked_query = ranked_query.with_reranking(k);
         }
         ranked_query = apply_include_invalidated(ranked_query, request.include_invalidated);
+        ranked_query = apply_include_dreams(ranked_query, request.include_dreams);
 
         let mut total_query = ranked_query.clone();
         total_query.limit = chain.thoughts().len().max(1);
@@ -4035,6 +4079,7 @@ impl MentisDbService {
         let chain = chain.read().await;
         let last_n = request.last_n.unwrap_or(12);
         let include_invalidated = request.include_invalidated.unwrap_or(false);
+        let include_dreams = request.include_dreams.unwrap_or(false);
         let thoughts: Vec<&crate::Thought> = if let Some(ref agent_id) = request.agent_id {
             let mut filtered: Vec<&crate::Thought> = chain
                 .thoughts()
@@ -4042,6 +4087,7 @@ impl MentisDbService {
                 .rev()
                 .filter(|t| t.agent_id == *agent_id)
                 .filter(|t| include_invalidated || !chain.is_invalidated(t.id))
+                .filter(|t| include_dreams || t.role != crate::ThoughtRole::Dream)
                 .take(last_n)
                 .collect();
             filtered.reverse();
@@ -4052,6 +4098,7 @@ impl MentisDbService {
                 .iter()
                 .rev()
                 .filter(|t| include_invalidated || !chain.is_invalidated(t.id))
+                .filter(|t| include_dreams || t.role != crate::ThoughtRole::Dream)
                 .take(last_n)
                 .collect::<Vec<_>>()
                 .into_iter()
@@ -4609,6 +4656,43 @@ impl MentisDbService {
         })
     }
 
+    /// Manually trigger a dream pass, ignoring idleness.
+    ///
+    /// Shares [`Self::dream_locks`](MentisDbService) with the idle scheduler
+    /// so a manual trigger and an automatic pass never run concurrently on
+    /// the same chain.
+    pub(crate) async fn dream(
+        &self,
+        request: DreamRequest,
+    ) -> Result<DreamResponse, Box<dyn Error + Send + Sync>> {
+        let chain_key = self.resolve_chain_key(request.chain_key.as_deref());
+        let dry_run = request.dry_run.unwrap_or(false);
+        let phases = request.phases.unwrap_or_default();
+
+        let _lock = try_acquire_dream_lock(&self.dream_locks, &chain_key).ok_or_else(|| {
+            invalid_input_error(format!(
+                "a dream pass is already running for chain '{chain_key}'"
+            ))
+        })?;
+
+        let chain = self.get_chain(Some(&chain_key), None).await?;
+        let report = {
+            let mut guard = chain.write().await;
+            crate::dream::run_dream_pass(&mut guard, &self.config.dream, dry_run, &phases)?
+        };
+
+        self.log_interaction(InteractionLogEntry {
+            access: "write",
+            operation: "dream",
+            chain_key,
+            metadata: InteractionMetadata::default(),
+            result_count: Some(1),
+            note: Some(format!("dry_run={dry_run}")),
+        });
+
+        Ok(DreamResponse { report, ran: true })
+    }
+
     async fn head(
         &self,
         request: ChainHeadRequest,
@@ -4651,7 +4735,7 @@ impl MentisDbService {
         Ok(())
     }
 
-    fn resolve_chain_key(&self, chain_key: Option<&str>) -> String {
+    pub(crate) fn resolve_chain_key(&self, chain_key: Option<&str>) -> String {
         chain_key
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -5148,6 +5232,9 @@ struct SearchRequest {
     /// When true, include superseded/corrected/invalidated thoughts.
     #[serde(default)]
     include_invalidated: Option<bool>,
+    /// When true, include `Dream`-role thoughts.
+    #[serde(default)]
+    include_dreams: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5205,6 +5292,10 @@ struct RankedSearchRequest {
     /// When true, include superseded/corrected/invalidated thoughts.
     #[serde(default)]
     include_invalidated: Option<bool>,
+    /// When true, include `Dream`-role thoughts, down-weighted by
+    /// `dream_weight`.
+    #[serde(default)]
+    include_dreams: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -5379,6 +5470,10 @@ struct FederatedSearchRequest {
     /// When true, include superseded/corrected/invalidated thoughts.
     #[serde(default)]
     include_invalidated: Option<bool>,
+    /// When true, include `Dream`-role thoughts, down-weighted by
+    /// `dream_weight`.
+    #[serde(default)]
+    include_dreams: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5608,6 +5703,57 @@ struct ExtractMemoriesResponse {
     usage: TokenUsage,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct DreamRequest {
+    /// Optional chain key. Defaults to the server default.
+    pub(crate) chain_key: Option<String>,
+    /// When true, compute and return the pass report without appending
+    /// anything. Defaults to false.
+    pub(crate) dry_run: Option<bool>,
+    /// Optional subset of dream phases to run. Validated against
+    /// [`crate::dream::DREAM_PHASE_NAMES`] but has no effect until Phase 1/2
+    /// land.
+    pub(crate) phases: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DreamResponse {
+    /// The pass report.
+    pub(crate) report: crate::dream::DreamReport,
+    /// Always `true`: unlike the idle scheduler, a manual trigger always
+    /// runs when invoked (it ignores idleness). Reserved for a future
+    /// distinction if the manual trigger ever gains a reason to refuse.
+    pub(crate) ran: bool,
+}
+
+/// Tracks chain keys with a dream pass currently running so a manual
+/// trigger and the idle scheduler never overlap on one chain. Removes its
+/// entry on drop, including on early return or panic.
+struct DreamLockGuard {
+    locks: Arc<DashMap<String, ()>>,
+    chain_key: String,
+}
+
+impl Drop for DreamLockGuard {
+    fn drop(&mut self) {
+        self.locks.remove(&self.chain_key);
+    }
+}
+
+fn try_acquire_dream_lock(
+    locks: &Arc<DashMap<String, ()>>,
+    chain_key: &str,
+) -> Option<DreamLockGuard> {
+    if locks.insert(chain_key.to_string(), ()).is_some() {
+        None
+    } else {
+        Some(DreamLockGuard {
+            locks: Arc::clone(locks),
+            chain_key: chain_key.to_string(),
+        })
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ThoughtResponse {
     chain_key: String,
@@ -5834,6 +5980,9 @@ struct RecentContextRequest {
     /// When true, include superseded/corrected/invalidated thoughts.
     #[serde(default)]
     include_invalidated: Option<bool>,
+    /// When true, include `Dream`-role thoughts.
+    #[serde(default)]
+    include_dreams: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -7072,6 +7221,13 @@ async fn rest_extract_memories_handler(
     service_call(service.extract_memories(request).await)
 }
 
+async fn rest_dream_handler(
+    State(service): State<Arc<MentisDbService>>,
+    Json(request): Json<DreamRequest>,
+) -> Result<Json<DreamResponse>, (StatusCode, Json<Value>)> {
+    service_call(service.dream(request).await)
+}
+
 async fn rest_flush_handler(
     State(service): State<Arc<MentisDbService>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -7286,7 +7442,8 @@ fn mcp_tool_metadata() -> Vec<ToolMetadata> {
         .with_parameter(ToolParameter::new("until", ToolParameterType::String).with_description("Optional RFC 3339 upper timestamp bound."))
             .with_parameter(ToolParameter::new("limit", ToolParameterType::Integer).with_description("Optional maximum number of results."))
             .with_parameter(ToolParameter::new("entity_type", ToolParameterType::String).with_description("Optional entity type label to filter by."))
-            .with_parameter(ToolParameter::new("include_invalidated", ToolParameterType::Boolean).with_description("When true, include thoughts superseded/corrected/invalidated by later memory. Default false.")),
+            .with_parameter(ToolParameter::new("include_invalidated", ToolParameterType::Boolean).with_description("When true, include thoughts superseded/corrected/invalidated by later memory. Default false."))
+            .with_parameter(ToolParameter::new("include_dreams", ToolParameterType::Boolean).with_description("When true, include Dream-role (offline consolidation) thoughts. Default false.")),
         ToolMetadata::new(
             "mentisdb_lexical_search",
             "Run a lexical-ranked search over thread text and return scored results with offset/limit paging.",
@@ -7318,7 +7475,8 @@ fn mcp_tool_metadata() -> Vec<ToolMetadata> {
         .with_parameter(ToolParameter::new("since", ToolParameterType::String).with_description("Optional RFC 3339 lower timestamp bound."))
         .with_parameter(ToolParameter::new("until", ToolParameterType::String).with_description("Optional RFC 3339 upper timestamp bound."))
         .with_parameter(ToolParameter::new("entity_type", ToolParameterType::String).with_description("Optional entity type label to filter by."))
-        .with_parameter(ToolParameter::new("include_invalidated", ToolParameterType::Boolean).with_description("When true, include thoughts superseded/corrected/invalidated by later memory. Default false — normal ranked search hides stale memories.")),
+        .with_parameter(ToolParameter::new("include_invalidated", ToolParameterType::Boolean).with_description("When true, include thoughts superseded/corrected/invalidated by later memory. Default false — normal ranked search hides stale memories."))
+        .with_parameter(ToolParameter::new("include_dreams", ToolParameterType::Boolean).with_description("When true, include Dream-role thoughts, down-weighted by dream_weight and labeled via each hit's thought role. Default false.")),
         ToolMetadata::new(
             "mentisdb_federated_search",
             "Run federated ranked retrieval over multiple chains simultaneously and return a single merged, ranked result list. Useful for multi-agent hubs or cross-organizational memory aggregation.",
@@ -7344,7 +7502,8 @@ fn mcp_tool_metadata() -> Vec<ToolMetadata> {
         .with_parameter(ToolParameter::new("enable_reranking", ToolParameterType::Boolean).with_description("Enable RRF reranking."))
         .with_parameter(ToolParameter::new("rerank_k", ToolParameterType::Integer).with_description("RRF candidates window size."))
         .with_parameter(ToolParameter::new("entity_type", ToolParameterType::String).with_description("Optional entity type label to filter by."))
-        .with_parameter(ToolParameter::new("include_invalidated", ToolParameterType::Boolean).with_description("When true, include thoughts superseded/corrected/invalidated by later memory. Default false.")),
+        .with_parameter(ToolParameter::new("include_invalidated", ToolParameterType::Boolean).with_description("When true, include thoughts superseded/corrected/invalidated by later memory. Default false."))
+        .with_parameter(ToolParameter::new("include_dreams", ToolParameterType::Boolean).with_description("When true, include Dream-role thoughts, down-weighted by dream_weight. Default false.")),
         ToolMetadata::new(
             "mentisdb_context_bundles",
             "Return deterministic seed-anchored grouped context bundles over query_context_bundles. Use this when you want supporting context grouped beneath the best lexical seed thoughts.",
@@ -7366,7 +7525,8 @@ fn mcp_tool_metadata() -> Vec<ToolMetadata> {
         .with_parameter(ToolParameter::new("since", ToolParameterType::String).with_description("Optional RFC 3339 lower timestamp bound."))
         .with_parameter(ToolParameter::new("until", ToolParameterType::String).with_description("Optional RFC 3339 upper timestamp bound."))
         .with_parameter(ToolParameter::new("entity_type", ToolParameterType::String).with_description("Optional entity type label to filter by."))
-        .with_parameter(ToolParameter::new("include_invalidated", ToolParameterType::Boolean).with_description("When true, include superseded/corrected/invalidated thoughts as seeds or support. Default false.")),
+        .with_parameter(ToolParameter::new("include_invalidated", ToolParameterType::Boolean).with_description("When true, include superseded/corrected/invalidated thoughts as seeds or support. Default false."))
+        .with_parameter(ToolParameter::new("include_dreams", ToolParameterType::Boolean).with_description("When true, include Dream-role thoughts as seeds or support, down-weighted by dream_weight. Default false.")),
         ToolMetadata::new(
             "mentisdb_summary_candidates",
             "Return deterministic append-only summary source candidates. This only selects source windows; it does not generate or append summary thoughts.",
@@ -7466,7 +7626,8 @@ fn mcp_tool_metadata() -> Vec<ToolMetadata> {
         .with_parameter(ToolParameter::new("chain_key", ToolParameterType::String).with_description("Optional durable chain key."))
         .with_parameter(ToolParameter::new("last_n", ToolParameterType::Integer).with_description("How many recent thoughts to include."))
         .with_parameter(ToolParameter::new("agent_id", ToolParameterType::String).with_description("Optional agent id filter to scope context to one agent."))
-        .with_parameter(ToolParameter::new("include_invalidated", ToolParameterType::Boolean).with_description("When true, include superseded/corrected/invalidated thoughts in recent context. Default false.")),
+        .with_parameter(ToolParameter::new("include_invalidated", ToolParameterType::Boolean).with_description("When true, include superseded/corrected/invalidated thoughts in recent context. Default false."))
+        .with_parameter(ToolParameter::new("include_dreams", ToolParameterType::Boolean).with_description("When true, include Dream-role (offline consolidation) thoughts in recent context. Default false.")),
         ToolMetadata::new(
             "mentisdb_memory_markdown",
             "Export a MEMORY.md style Markdown summary from MentisDb.",
@@ -7690,6 +7851,17 @@ fn mcp_tool_metadata() -> Vec<ToolMetadata> {
         .with_parameter(ToolParameter::new("chain_key", ToolParameterType::String).with_description("Optional durable chain key. Defaults to the server default."))
         .with_parameter(ToolParameter::new("agent_id", ToolParameterType::String).with_description("Optional agent ID for the extracted thoughts."))
         .with_parameter(ToolParameter::new("prompt_template", ToolParameterType::String).with_description("Optional custom prompt template. Use {{text}} for the input and {{types}} for valid ThoughtType names.")),
+        ToolMetadata::new(
+            "mentisdb_dream",
+            "Manually trigger an offline dream pass on a chain, ignoring idleness. \
+             Registers the mentis-dreamer agent, resumes from the chain's last dream \
+             report (or scans up to max_scan thoughts on the first pass), and appends \
+             a new report. Phase 0 performs no consolidation, decay, or recombination \
+             yet — this is pure scaffolding for later phases.",
+        )
+        .with_parameter(ToolParameter::new("chain_key", ToolParameterType::String).with_description("Optional durable chain key. Defaults to the server default."))
+        .with_parameter(ToolParameter::new("dry_run", ToolParameterType::Boolean).with_description("When true, compute and return the pass report without appending anything. Default false."))
+        .with_parameter(ToolParameter::new("phases", ToolParameterType::Array).with_description("Optional subset of dream phases to run (consolidate, decay, recombine). Validated but has no effect until Phase 1/2 land.").with_items(ToolParameterType::String)),
     ]
 }
 
@@ -8026,6 +8198,9 @@ fn build_query(request: &SearchRequest) -> Result<ThoughtQuery, Box<dyn Error + 
     if request.include_invalidated.unwrap_or(false) {
         query = query.with_include_invalidated(true);
     }
+    if request.include_dreams.unwrap_or(false) {
+        query = query.with_include_dreams(true);
+    }
     Ok(query)
 }
 
@@ -8035,6 +8210,16 @@ fn apply_include_invalidated(
 ) -> RankedSearchQuery {
     if include_invalidated.unwrap_or(false) {
         ranked_query = ranked_query.with_include_invalidated(true);
+    }
+    ranked_query
+}
+
+fn apply_include_dreams(
+    mut ranked_query: RankedSearchQuery,
+    include_dreams: Option<bool>,
+) -> RankedSearchQuery {
+    if include_dreams.unwrap_or(false) {
+        ranked_query = ranked_query.with_include_dreams(true);
     }
     ranked_query
 }
@@ -8074,6 +8259,7 @@ fn build_ranked_filter_query(
         limit: None,
         entity_type: request.entity_type.clone(),
         include_invalidated: request.include_invalidated,
+        include_dreams: request.include_dreams,
     })
 }
 
@@ -8393,6 +8579,7 @@ fn parse_thought_role(input: &str) -> Result<ThoughtRole, Box<dyn Error + Send +
         "handoff" => ThoughtRole::Handoff,
         "audit" => ThoughtRole::Audit,
         "retrospective" => ThoughtRole::Retrospective,
+        "dream" => ThoughtRole::Dream,
         _ => return Err(format!("Unknown ThoughtRole '{input}'").into()),
     };
 

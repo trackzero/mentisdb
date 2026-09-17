@@ -304,6 +304,12 @@ pub mod backup;
 pub mod cli;
 #[cfg(feature = "server")]
 pub(crate) mod dashboard;
+/// Offline, idle-time consolidation ("dreaming") of stored memory.
+///
+/// See `docs/dreaming-design.md` in the repository for the full design.
+/// Off by default; the no-LLM core (this module, minus its `server`-gated
+/// `scheduler` submodule) requires no optional feature.
+pub mod dream;
 pub mod integrations;
 pub mod llm;
 pub mod paths;
@@ -2076,6 +2082,9 @@ pub enum ThoughtRole {
     Audit,
     /// A role emitted during deliberate post-incident or post-struggle reflection.
     Retrospective,
+    /// Written by an unprompted offline consolidation or recombination pass;
+    /// lower trust until promoted.
+    Dream,
 }
 
 /// Visibility scope for a thought.
@@ -2949,6 +2958,21 @@ pub struct ThoughtQuery {
     /// assert!(audit.include_invalidated);
     /// ```
     pub include_invalidated: bool,
+    /// When `true`, include [`ThoughtRole::Dream`] thoughts.
+    ///
+    /// Defaults to `false`: normal search, ranked search, and recent context
+    /// hide dream-role thoughts so agents see confirmed memory rather than
+    /// unreviewed offline-consolidation output. Set this to review dreams
+    /// explicitly (e.g. before promoting or dismissing one).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use mentisdb::ThoughtQuery;
+    /// let review = ThoughtQuery::new().with_include_dreams(true);
+    /// assert!(review.include_dreams);
+    /// ```
+    pub include_dreams: bool,
 }
 
 impl ThoughtQuery {
@@ -3138,6 +3162,15 @@ impl ThoughtQuery {
     /// need the full audit trail.
     pub fn with_include_invalidated(mut self, include_invalidated: bool) -> Self {
         self.include_invalidated = include_invalidated;
+        self
+    }
+
+    /// Include or exclude [`ThoughtRole::Dream`] thoughts.
+    ///
+    /// Default retrieval excludes them (`false`). Pass `true` to review
+    /// dream output explicitly.
+    pub fn with_include_dreams(mut self, include_dreams: bool) -> Self {
+        self.include_dreams = include_dreams;
         self
     }
 
@@ -3386,6 +3419,14 @@ pub struct RankedSearchQuery {
     /// Point-in-time (`as_of`) queries still exclude thoughts that were already
     /// invalidated at that timestamp unless this flag is set.
     pub include_invalidated: bool,
+    /// When `true`, keep [`ThoughtRole::Dream`] thoughts in ranked results.
+    ///
+    /// Defaults to `false`. Also set when `filter.include_dreams` is true.
+    /// Included dream thoughts have their score multiplied by
+    /// [`DreamConfig::dream_weight`](crate::dream::DreamConfig::dream_weight)
+    /// and are identifiable via [`RankedSearchHit::thought`]'s
+    /// [`Thought::role`].
+    pub include_dreams: bool,
     /// Optional memory scope filter.
     ///
     /// When set, only thoughts tagged with the matching `scope:{variant}` tag
@@ -3521,6 +3562,25 @@ impl RankedSearchQuery {
         self
     }
 
+    /// Include [`ThoughtRole::Dream`] thoughts in ranked results,
+    /// down-weighted by `dream_weight` and still identifiable via the
+    /// thought's role.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use mentisdb::RankedSearchQuery;
+    /// let query = RankedSearchQuery::new()
+    ///     .with_text("consolidation")
+    ///     .with_include_dreams(true);
+    /// assert!(query.include_dreams);
+    /// ```
+    pub fn with_include_dreams(mut self, include_dreams: bool) -> Self {
+        self.include_dreams = include_dreams;
+        self.filter.include_dreams = include_dreams;
+        self
+    }
+
     /// Filter results to a specific memory scope.
     ///
     /// This adds a `scope:{variant}` tag to the underlying filter's
@@ -3576,6 +3636,7 @@ impl Default for RankedSearchQuery {
             limit: 10,
             as_of: None,
             include_invalidated: false,
+            include_dreams: false,
             scope: None,
             enable_reranking: false,
             rerank_k: 50,
@@ -4573,6 +4634,10 @@ pub struct MentisDb {
     auto_edge_threshold: f32,
     /// Max neighbors per thought for auto-inferred edges.
     auto_edge_k: usize,
+    /// Dreaming configuration for this chain, used to weight
+    /// [`ThoughtRole::Dream`] hits in [`Self::query_ranked`]. Not gated by
+    /// the `server` feature: dreaming's no-LLM core must work without it.
+    dream_config: crate::dream::DreamConfig,
     #[cfg(feature = "server")]
     webhook_manager: Option<crate::webhooks::WebhookManager>,
 }
@@ -4710,6 +4775,7 @@ impl MentisDb {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(AUTO_EDGE_DEFAULT_K),
+            dream_config: crate::dream::DreamConfig::default(),
             #[cfg(feature = "server")]
             webhook_manager: None,
         };
@@ -6015,6 +6081,9 @@ impl MentisDb {
                 if !query.include_invalidated && self.is_invalidated(thought.id) {
                     return false;
                 }
+                if !query.include_dreams && thought.role == ThoughtRole::Dream {
+                    return false;
+                }
                 let thought_matches = if indexed_filters_applied {
                     query.matches_post_index_filters(thought)
                 } else {
@@ -6073,6 +6142,7 @@ impl MentisDb {
             &request.filter,
             request.as_of,
             request.include_invalidated || request.filter.include_invalidated,
+            request.include_dreams || request.filter.include_dreams,
         );
         let ranked_text = request
             .text
@@ -6229,6 +6299,17 @@ impl MentisDb {
             }
         }
 
+        // Dream-role thoughts only reach this point when the caller opted in
+        // via `include_dreams`; down-weight them so confirmed memory still
+        // wins ties against unreviewed offline-consolidation output.
+        if self.dream_config.dream_weight != 1.0 {
+            for hit in &mut hits {
+                if hit.thought.role == ThoughtRole::Dream {
+                    hit.score.total *= self.dream_config.dream_weight;
+                }
+            }
+        }
+
         let total_candidates = hits.len();
 
         hits.sort_by(|left, right| {
@@ -6280,6 +6361,7 @@ impl MentisDb {
             &request.filter,
             request.as_of,
             request.include_invalidated || request.filter.include_invalidated,
+            request.include_dreams || request.filter.include_dreams,
         );
         let ranked_text = request
             .text
@@ -8496,9 +8578,16 @@ impl MentisDb {
     /// # }
     /// ```
     pub fn to_memory_markdown(&self, query: Option<&ThoughtQuery>) -> String {
-        let thoughts = query
+        // Dream-role thoughts never appear in MEMORY.md, regardless of
+        // `query` (there is no `include_dreams` opt-in for this export):
+        // it is meant to reflect confirmed memory, not unreviewed offline
+        // consolidation output.
+        let thoughts: Vec<&Thought> = query
             .map(|query| self.query(query))
-            .unwrap_or_else(|| self.thoughts.iter().collect());
+            .unwrap_or_else(|| self.thoughts.iter().collect())
+            .into_iter()
+            .filter(|thought| thought.role != ThoughtRole::Dream)
+            .collect();
 
         let mut markdown = String::from("# MEMORY\n\n");
         markdown.push_str(&format!(
@@ -8724,12 +8813,16 @@ impl MentisDb {
         filter: &ThoughtQuery,
         as_of: Option<DateTime<Utc>>,
         include_invalidated: bool,
+        include_dreams: bool,
     ) -> Vec<&'a Thought> {
         let mut filter = filter.clone();
         if include_invalidated || as_of.is_some() {
             // as_of needs access to thoughts that are live-invalidated but were
             // still current at the historical timestamp.
             filter.include_invalidated = true;
+        }
+        if include_dreams {
+            filter.include_dreams = true;
         }
         let candidates = self.query(&filter);
         let Some(as_of) = as_of else {
@@ -8859,6 +8952,13 @@ impl MentisDb {
     #[cfg(feature = "server")]
     pub fn with_webhook_manager(&mut self, manager: crate::webhooks::WebhookManager) -> &mut Self {
         self.webhook_manager = Some(manager);
+        self
+    }
+
+    /// Set the dreaming configuration used to weight [`ThoughtRole::Dream`]
+    /// hits in [`Self::query_ranked`].
+    pub fn with_dream_config(&mut self, config: crate::dream::DreamConfig) -> &mut Self {
+        self.dream_config = config;
         self
     }
 
@@ -10497,6 +10597,7 @@ fn parse_thought_role_from_debug(input: &str) -> Option<ThoughtRole> {
         "handoff" => Some(ThoughtRole::Handoff),
         "audit" => Some(ThoughtRole::Audit),
         "retrospective" => Some(ThoughtRole::Retrospective),
+        "dream" => Some(ThoughtRole::Dream),
         _ => None,
     }
 }

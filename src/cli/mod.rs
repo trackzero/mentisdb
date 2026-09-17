@@ -17,9 +17,9 @@ use crate::paths::default_mentisdb_dir;
 
 pub use args::{
     add_help_text, agents_help_text, backup_help_text, bearer_token_help_text, cert_help_text,
-    help_text, parse_args, restore_help_text, search_help_text, setup_help_text, wizard_help_text,
-    AddCommand, AgentsCommand, BackupCommand, BearerTokenCommand, CertCommand, CliCommand,
-    RestoreCommand, SearchCommand, SetupCommand, WizardCommand,
+    dream_help_text, help_text, parse_args, restore_help_text, search_help_text, setup_help_text,
+    wizard_help_text, AddCommand, AgentsCommand, BackupCommand, BearerTokenCommand, CertCommand,
+    CliCommand, DreamCommand, RestoreCommand, SearchCommand, SetupCommand, WizardCommand,
 };
 pub use cert::{
     build_extra_sans, resolve_paths, run_cert, update_env_file, CERT_FILENAME, KEY_FILENAME,
@@ -63,6 +63,10 @@ where
         }
         Ok(CliCommand::SearchHelp) => {
             let _ = write!(out, "{}", search_help_text());
+            ExitCode::SUCCESS
+        }
+        Ok(CliCommand::DreamHelp) => {
+            let _ = write!(out, "{}", dream_help_text());
             ExitCode::SUCCESS
         }
         Ok(CliCommand::AgentsHelp) => {
@@ -110,6 +114,13 @@ where
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 let _ = writeln!(err, "search failed: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Ok(CliCommand::Dream(command)) => match run_dream(&command, out, err) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let _ = writeln!(err, "dream failed: {error}");
                 ExitCode::from(1)
             }
         },
@@ -376,6 +387,49 @@ fn run_search(
 ) -> Result<(), String> {
     let body = build_ranked_search_body(cmd);
     let url = format!("{}/v1/ranked-search", cmd.url.trim_end_matches('/'));
+    let response = ureq::post(&url)
+        .send_json(body)
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    let json: serde_json::Value = response
+        .into_json()
+        .map_err(|e| format!("parse response: {e}"))?;
+    let _ = writeln!(
+        out,
+        "{}",
+        serde_json::to_string_pretty(&json).unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// Build the JSON body for the `dream` subcommand, matching `DreamRequest`
+/// in the REST API.
+pub fn build_dream_body(cmd: &DreamCommand) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    if let Some(ref chain) = cmd.chain {
+        body.insert(
+            "chain_key".to_string(),
+            serde_json::Value::String(chain.clone()),
+        );
+    }
+    body.insert("dry_run".to_string(), serde_json::Value::Bool(cmd.dry_run));
+    if let Some(ref phase) = cmd.phase {
+        body.insert(
+            "phases".to_string(),
+            serde_json::Value::Array(
+                phase
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(body)
+}
+
+fn run_dream(cmd: &DreamCommand, out: &mut dyn Write, _err: &mut dyn Write) -> Result<(), String> {
+    let body = build_dream_body(cmd);
+    let url = format!("{}/v1/dream", cmd.url.trim_end_matches('/'));
     let response = ureq::post(&url)
         .send_json(body)
         .map_err(|e| format!("POST {url}: {e}"))?;

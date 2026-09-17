@@ -322,10 +322,11 @@ enum ThoughtRole {
     Handoff,        // handoff to another agent
     Audit,          // audit trail entry
     Retrospective,  // post-hoc lesson
+    Dream,          // written by an offline consolidation pass
 }
 ```
 
-The combination of type × role gives 240 distinguishable semantic positions. A
+The combination of type × role gives 270 distinguishable semantic positions. A
 retrospective lesson is `(LessonLearned, Retrospective)`. A context-compression checkpoint
 is `(Summary, Checkpoint)`.
 

@@ -6,7 +6,10 @@
 //! tests pin the outgoing JSON body so the CLI and the REST schema cannot drift
 //! again without a failing test.
 
-use mentisdb::cli::{build_add_body, build_ranked_search_body, AddCommand, SearchCommand};
+use mentisdb::cli::{
+    build_add_body, build_dream_body, build_ranked_search_body, parse_args, AddCommand, CliCommand,
+    DreamCommand, SearchCommand,
+};
 
 fn add_command(content: &str, thought_type: Option<&str>) -> AddCommand {
     AddCommand {
@@ -106,5 +109,86 @@ fn search_body_uses_text_field() {
     assert!(
         body.get("query").is_none(),
         "must not send the old query field"
+    );
+}
+
+fn dream_command(chain: Option<&str>, dry_run: bool, phase: Option<Vec<&str>>) -> DreamCommand {
+    DreamCommand {
+        chain: chain.map(str::to_string),
+        dry_run,
+        phase: phase.map(|p| p.into_iter().map(str::to_string).collect()),
+        url: "http://127.0.0.1:9472".to_string(),
+    }
+}
+
+/// The dream body maps CLI fields onto the `POST /v1/dream` request shape.
+#[test]
+fn dream_body_maps_fields() {
+    let body = build_dream_body(&dream_command(
+        Some("chain-1"),
+        true,
+        Some(vec!["consolidate", "decay"]),
+    ));
+    assert_eq!(body["chain_key"], "chain-1");
+    assert_eq!(body["dry_run"], true);
+    assert_eq!(body["phases"], serde_json::json!(["consolidate", "decay"]));
+}
+
+/// Omitted optional fields are left out of the body rather than sent as null,
+/// matching the other subcommands' payload style.
+#[test]
+fn dream_body_omits_absent_optional_fields() {
+    let body = build_dream_body(&dream_command(None, false, None));
+    assert!(body.get("chain_key").is_none());
+    assert_eq!(body["dry_run"], false);
+    assert!(body.get("phases").is_none());
+}
+
+/// `mentisdb dream --dry-run` parses with no chain/phase set.
+#[test]
+fn parse_args_parses_dream_dry_run() {
+    let command = parse_args(["mentisdb", "dream", "--dry-run"]).unwrap();
+    assert_eq!(
+        command,
+        CliCommand::Dream(DreamCommand {
+            chain: None,
+            dry_run: true,
+            phase: None,
+            url: "http://127.0.0.1:9472".to_string(),
+        })
+    );
+}
+
+/// `--chain` and a comma-separated `--phase` list both parse.
+#[test]
+fn parse_args_parses_dream_chain_and_phase_list() {
+    let command = parse_args([
+        "mentisdb",
+        "dream",
+        "--chain",
+        "project-x",
+        "--phase",
+        "consolidate,decay",
+    ])
+    .unwrap();
+    assert_eq!(
+        command,
+        CliCommand::Dream(DreamCommand {
+            chain: Some("project-x".to_string()),
+            dry_run: false,
+            phase: Some(vec!["consolidate".to_string(), "decay".to_string()]),
+            url: "http://127.0.0.1:9472".to_string(),
+        })
+    );
+}
+
+/// An unknown phase name fails locally with an actionable message instead of
+/// an opaque server 4xx.
+#[test]
+fn parse_args_rejects_unknown_dream_phase() {
+    let error = parse_args(["mentisdb", "dream", "--phase", "not-a-real-phase"]).unwrap_err();
+    assert!(
+        error.contains("not-a-real-phase"),
+        "unexpected error: {error}"
     );
 }

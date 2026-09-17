@@ -132,8 +132,23 @@ impl Clone for WebhookManager {
 #[derive(Debug, Clone)]
 struct DeliveryJob {
     url: String,
-    payload: WebhookPayload,
+    payload: serde_json::Value,
     webhook_id: Uuid,
+}
+
+/// JSON payload sent to webhook endpoints when a dream pass completes.
+///
+/// See [`WebhookManager::deliver_dream_report`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DreamWebhookPayload {
+    /// The event type, always "dream.completed".
+    pub event: String,
+    /// The chain key the pass ran against.
+    pub chain_key: String,
+    /// The pass report.
+    pub report: crate::dream::DreamReport,
+    /// UTC timestamp when the webhook was sent.
+    pub timestamp: DateTime<Utc>,
 }
 
 impl WebhookManager {
@@ -306,6 +321,9 @@ impl WebhookManager {
             let Some(queue) = &self.delivery_queue else {
                 continue;
             };
+            let Ok(payload) = serde_json::to_value(&payload) else {
+                continue;
+            };
             let job = DeliveryJob {
                 url: registration.url.clone(),
                 payload,
@@ -315,6 +333,53 @@ impl WebhookManager {
                 log::warn!(
                     target: "mentisdb::webhooks",
                     "dropping webhook delivery because the queue is full or unavailable: {}",
+                    error
+                );
+            }
+        }
+    }
+
+    /// Delivers a `dream.completed` webhook notification for a finished
+    /// dream pass.
+    ///
+    /// This method is non-blocking: it spawns asynchronous tasks for each
+    /// matching webhook and returns immediately. Unlike
+    /// [`Self::deliver_for_thought`], this bypasses each registration's
+    /// `thought_type_filter`: a pass report has no single [`ThoughtType`],
+    /// so type-filtered webhooks still receive it. Chain-key filtering still
+    /// applies.
+    pub fn deliver_dream_report(&self, chain_key: &str, report: &crate::dream::DreamReport) {
+        let webhooks = self.list_webhooks();
+        for registration in webhooks {
+            if !registration.active {
+                continue;
+            }
+            if let Some(ref filter_chain) = registration.chain_key_filter {
+                if filter_chain != chain_key {
+                    continue;
+                }
+            }
+            let payload = DreamWebhookPayload {
+                event: "dream.completed".to_string(),
+                chain_key: chain_key.to_string(),
+                report: report.clone(),
+                timestamp: Utc::now(),
+            };
+            let Some(queue) = &self.delivery_queue else {
+                continue;
+            };
+            let Ok(payload) = serde_json::to_value(&payload) else {
+                continue;
+            };
+            let job = DeliveryJob {
+                url: registration.url.clone(),
+                payload,
+                webhook_id: registration.id,
+            };
+            if let Err(error) = queue.try_send(job) {
+                log::warn!(
+                    target: "mentisdb::webhooks",
+                    "dropping dream.completed webhook delivery because the queue is full or unavailable: {}",
                     error
                 );
             }
@@ -356,7 +421,7 @@ fn webhook_http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(reqwest::Client::new)
 }
 
-async fn deliver_with_retries(url: String, payload: WebhookPayload, webhook_id: Uuid) {
+async fn deliver_with_retries(url: String, payload: serde_json::Value, webhook_id: Uuid) {
     let client = webhook_http_client();
     let mut backoff_ms = WEBHOOK_INITIAL_BACKOFF_MS;
 
@@ -400,7 +465,7 @@ async fn deliver_with_retries(url: String, payload: WebhookPayload, webhook_id: 
 async fn deliver_once(
     client: &reqwest::Client,
     url: &str,
-    payload: &WebhookPayload,
+    payload: &serde_json::Value,
 ) -> io::Result<()> {
     let timeout = tokio::time::Duration::from_secs(WEBHOOK_DELIVERY_TIMEOUT_SECS);
     client
@@ -662,6 +727,7 @@ mod tests {
             timestamp: Utc::now(),
         };
 
+        let payload = serde_json::to_value(&payload).unwrap();
         for i in 0..(WEBHOOK_MAX_CONCURRENT_DELIVERIES * 3) {
             receiver
                 .send(DeliveryJob {

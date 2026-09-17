@@ -122,6 +122,8 @@ Most resumable notes should be `Summary` with `role: Checkpoint`.
 
 `thought_type` names are matched case-insensitively and ignore separators, so `LessonLearned`, `lesson-learned`, and `lesson learned` are equivalent. The table lists the types you will reach for most; the enum is the full set.
 
+**Don't write `role: Dream` yourself.** It's reserved for offline consolidation passes (see `docs/dreaming-design.md`) — content written by an agent should stay `role: Memory` (or another role above). Dream-role thoughts are excluded from `recent_context`, ranked search, and `memory_markdown` by default; pass `include_dreams=true` to review them, or trigger a manual pass with `mentisdb_dream`.
+
 ## 🔗 THOUGHT GRAPH
 
 Link via `refs: [index]` (intra-chain) or typed `relations` with `kind` and `target_id`:

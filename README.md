@@ -2065,7 +2065,7 @@ The retrospective helper:
 
 ## Thought Types And Roles
 
-MentisDB currently defines 31 semantic `ThoughtType` values and 8 operational
+MentisDB currently defines 31 semantic `ThoughtType` values and 9 operational
 `ThoughtRole` values.
 
 Thought types:
@@ -2088,6 +2088,8 @@ Thought roles:
 - `Handoff`
 - `Audit`
 - `Retrospective`
+- `Dream` — written by an offline consolidation pass; excluded from retrieval
+  by default (see [Dreaming](#dreaming) below)
 
 Use `ThoughtType` to say what the memory means semantically, and `ThoughtRole`
 to say how the system should treat it operationally. The crate rustdoc is the
@@ -2100,6 +2102,29 @@ every variant, `as_str()` / `Display` return the canonical PascalCase name, and
 `"factlearned"`, and `"FactLearned"` all parse to `FactLearned`). Unknown input
 returns `ParseThoughtTypeError`, whose message lists the valid types; the REST
 and MCP `thought_type` fields use the same parser.
+
+## Dreaming
+
+MentisDB can run an offline, idle-time consolidation pass ("dreaming") over
+stored memory. It is **off by default** and, in this release, is pure
+scaffolding: it registers a `mentis-dreamer` agent, resumes from a
+watermarked scan window, and appends a report — no consolidation, decay, or
+recombination logic exists yet. Later releases will add those on top of this
+foundation. See [docs/dreaming-design.md](docs/dreaming-design.md) for the
+full design and its non-negotiables (append-only, no-LLM core, provenance on
+every write, suggest-don't-act, off by default).
+
+- Manual trigger: `mentisdb_dream` (MCP), `POST /v1/dream` (REST), or
+  `mentisdb dream [--chain <key>] [--dry-run] [--phase <phase,...>]` (CLI).
+  Ignores idleness and always runs when invoked.
+- Idle scheduler: set `DreamConfig.enabled = true` (or `MENTISDB_DREAM_ENABLED=true`)
+  to let the daemon trigger passes automatically on chains that have been
+  idle for `idle_after_secs` (default 900s).
+- Every dream-written thought carries provenance via `ThoughtRole::Dream`,
+  the `mentis-dreamer` agent id, and `dream:*` tags. `include_dreams` (on
+  `ThoughtQuery` / `RankedSearchQuery` / `recent_context`) opts into seeing
+  them; they're excluded from `recent_context`, ranked search, and
+  `memory_markdown` by default.
 
 ### Memory Scopes
 

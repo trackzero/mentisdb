@@ -70,6 +70,21 @@ pub struct AgentsCommand {
     pub url: String,
 }
 
+/// Parsed `dream` subcommand arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DreamCommand {
+    /// Optional chain key.
+    pub chain: Option<String>,
+    /// Compute and return the pass report without appending anything.
+    pub dry_run: bool,
+    /// Optional subset of dream phases to run (see
+    /// [`crate::dream::DREAM_PHASE_NAMES`]). Validated at parse time; has no
+    /// effect until Phase 1/2 land.
+    pub phase: Option<Vec<String>>,
+    /// Daemon REST URL.
+    pub url: String,
+}
+
 /// Parsed `backup` subcommand arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupCommand {
@@ -201,6 +216,10 @@ pub enum CliCommand {
     Add(AddCommand),
     /// Search thoughts on a running daemon.
     Search(SearchCommand),
+    /// Print dream subcommand help.
+    DreamHelp,
+    /// Trigger a manual dream pass on a running daemon.
+    Dream(DreamCommand),
     /// List agents on a running daemon.
     Agents(AgentsCommand),
     /// Create a backup archive.
@@ -244,6 +263,7 @@ where
         "wizard" if has_help_flag => Ok(CliCommand::WizardHelp),
         "add" if has_help_flag => Ok(CliCommand::AddHelp),
         "search" if has_help_flag => Ok(CliCommand::SearchHelp),
+        "dream" if has_help_flag => Ok(CliCommand::DreamHelp),
         "agents" if has_help_flag => Ok(CliCommand::AgentsHelp),
         "backup" if has_help_flag => Ok(CliCommand::BackupHelp),
         "restore" if has_help_flag => Ok(CliCommand::RestoreHelp),
@@ -253,6 +273,7 @@ where
         "wizard" => parse_wizard(parts),
         "add" => parse_add(parts),
         "search" => parse_search(parts),
+        "dream" => parse_dream(parts),
         "agents" => parse_agents(parts),
         "backup" => parse_backup(parts),
         "restore" => parse_restore(parts),
@@ -290,6 +311,7 @@ Usage:
   mentisdb add <content> [--type <type>] [--scope <scope>] [--tag <tag>] [--agent <id>] [--chain <key>] [--url <url>]
   mentisdb search <query> [--limit <n>] [--scope <scope>] [--chain <key>] [--url <url>]
   mentisdb agents [--chain <key>] [--url <url>]
+  mentisdb dream [--chain <key>] [--dry-run] [--phase <phase,...>] [--url <url>]
   mentisdb backup [-o <path>] [--dir <path>] [--flush] [--include-tls]
   mentisdb restore <archive.mentis> [--dir <path>] [--overwrite] [--yes]
   mentisdb bearertoken create --global <alias> [--dir <path>]
@@ -399,6 +421,23 @@ Commands:
 
     Options:
       --chain <key>    Chain key (uses daemon default if omitted)
+      --url <url>      Daemon REST URL (default: http://127.0.0.1:9472)
+      --help           Show this help text
+
+  dream
+    Manually trigger an offline dream pass on a running MentisDB daemon.
+    Ignores idleness; always runs when invoked. Off by default otherwise —
+    see DreamConfig / MENTISDB_DREAM_* for the idle scheduler.
+
+    Examples:
+      mentisdb dream --dry-run
+      mentisdb dream --chain my-project
+      mentisdb dream --phase consolidate,decay
+
+    Options:
+      --chain <key>    Chain key (uses daemon default if omitted)
+      --dry-run        Compute and return the pass report without appending
+      --phase <list>   Comma-separated subset of: consolidate, decay, recombine
       --url <url>      Daemon REST URL (default: http://127.0.0.1:9472)
       --help           Show this help text
 
@@ -624,6 +663,33 @@ Notes:
 Examples:
   mentisdb search \"cache invalidation\"
   mentisdb search \"performance\" --limit 5 --scope session
+"
+}
+
+/// Return the help text for the `dream` subcommand.
+pub fn dream_help_text() -> &'static str {
+    "\
+mentisdb dream — Manually trigger an offline dream pass on a running MentisDB daemon.
+
+Usage:
+  mentisdb dream [--chain <key>] [--dry-run] [--phase <phase,...>] [--url <url>]
+
+Options:
+  --chain <key>    Chain key (uses daemon default if omitted)
+  --dry-run        Compute and return the pass report without appending anything
+  --phase <list>   Comma-separated subset of: consolidate, decay, recombine
+  --url <url>      Daemon REST URL (default: http://127.0.0.1:9472)
+  --help           Show this help text
+
+Notes:
+  This is the manual trigger; it ignores idleness and always runs when invoked.
+  Phase 0 performs no consolidation, decay, or recombination yet — --phase is
+  validated but has no effect until Phase 1/2 land.
+
+Examples:
+  mentisdb dream --dry-run
+  mentisdb dream --chain my-project
+  mentisdb dream --phase consolidate,decay
 "
 }
 
@@ -1092,6 +1158,62 @@ fn parse_search(args: Vec<String>) -> Result<CliCommand, String> {
         limit,
         scope,
         chain_key,
+        url,
+    }))
+}
+
+fn parse_dream(args: Vec<String>) -> Result<CliCommand, String> {
+    let mut chain = None;
+    let mut dry_run = false;
+    let mut phase = None;
+    let mut url = default_rest_url();
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--chain" => {
+                chain = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--chain requires a value".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
+            }
+            "--phase" => {
+                let raw = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--phase requires a value".to_string())?;
+                let names: Vec<String> =
+                    raw.split(',').map(str::trim).map(str::to_string).collect();
+                for name in &names {
+                    if !crate::dream::DREAM_PHASE_NAMES.contains(&name.as_str()) {
+                        return Err(format!(
+                            "Unknown dream phase '{name}'. Valid phases: {}",
+                            crate::dream::DREAM_PHASE_NAMES.join(", ")
+                        ));
+                    }
+                }
+                phase = Some(names);
+                index += 2;
+            }
+            "--url" => {
+                url = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--url requires a value".to_string())?
+                    .clone();
+                index += 2;
+            }
+            "-h" | "--help" => return Ok(CliCommand::DreamHelp),
+            other => return Err(format!("Unexpected argument '{other}' for dream")),
+        }
+    }
+    Ok(CliCommand::Dream(DreamCommand {
+        chain,
+        dry_run,
+        phase,
         url,
     }))
 }
