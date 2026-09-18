@@ -74,6 +74,61 @@ pub async fn extract_memories_from_text(
     config: &LlmExtractionConfig,
     prompt_template: Option<&str>,
 ) -> Result<ExtractionResult, LlmExtractionError> {
+    let user_content = if let Some(template) = prompt_template {
+        template
+            .replace(
+                "{{types}}",
+                "PreferenceUpdate, UserTrait, RelationshipUpdate, Finding, Insight, FactLearned, PatternDetected, Hypothesis, Mistake, Correction, LessonLearned, AssumptionInvalidated, Constraint, Plan, Subgoal, Decision, StrategyShift, Wonder, Question, Idea, Experiment, ActionTaken, TaskComplete, Checkpoint, StateSnapshot, Handoff, Summary, Surprise, Reframe, Goal",
+            )
+            .replace("{{text}}", text)
+    } else {
+        format!("{}\n\n{}", EXTRACTION_PROMPT.trim(), text)
+    };
+
+    let (raw_content, usage) = chat_completion(
+        config,
+        "You are a helpful memory analyst.",
+        &user_content,
+        EXTRACTION_TEMPERATURE,
+    )
+    .await?;
+
+    let extracted: ExtractedThoughts = serde_json::from_str(raw_content.trim()).map_err(|e| {
+        LlmExtractionError::ParseError(format!(
+            "LLM output is not valid JSON: {}\nRaw output: {}",
+            e, raw_content
+        ))
+    })?;
+
+    let thoughts = validate_and_transform_thoughts(extracted.thoughts)?;
+
+    let model = if config.model.is_empty() {
+        DEFAULT_LLM_MODEL.to_string()
+    } else {
+        config.model.clone()
+    };
+
+    Ok(ExtractionResult {
+        thoughts,
+        model,
+        usage,
+    })
+}
+
+/// Send one chat completion request to the configured OpenAI-compatible
+/// endpoint and return the raw (trimmed) response content plus token usage.
+///
+/// This is the shared low-level call used by [`extract_memories_from_text`]
+/// and by the Phase 2 dreaming pipeline (`crate::dream::recombine`,
+/// `crate::dream::consolidate`) for abstractive consolidation, recombination,
+/// and contradiction-check prompts. It does not parse the response as JSON —
+/// callers own their own response schema.
+pub(crate) async fn chat_completion(
+    config: &LlmExtractionConfig,
+    system: &str,
+    user: &str,
+    temperature: f32,
+) -> Result<(String, crate::TokenUsage), LlmExtractionError> {
     if config.api_key.is_empty() {
         return Err(LlmExtractionError::NotConfigured(
             "OPENAI_API_KEY is not set".to_string(),
@@ -92,17 +147,6 @@ pub async fn extract_memories_from_text(
         config.model.clone()
     };
 
-    let user_content = if let Some(template) = prompt_template {
-        template
-            .replace(
-                "{{types}}",
-                "PreferenceUpdate, UserTrait, RelationshipUpdate, Finding, Insight, FactLearned, PatternDetected, Hypothesis, Mistake, Correction, LessonLearned, AssumptionInvalidated, Constraint, Plan, Subgoal, Decision, StrategyShift, Wonder, Question, Idea, Experiment, ActionTaken, TaskComplete, Checkpoint, StateSnapshot, Handoff, Summary, Surprise, Reframe, Goal",
-            )
-            .replace("{{text}}", text)
-    } else {
-        format!("{}\n\n{}", EXTRACTION_PROMPT.trim(), text)
-    };
-
     let client = Client::new_with_base_url(&config.api_key, &base_url);
 
     let mut args = ChatArguments::new(
@@ -110,15 +154,15 @@ pub async fn extract_memories_from_text(
         vec![
             Message {
                 role: "system".to_owned(),
-                content: "You are a helpful memory analyst.".to_owned(),
+                content: system.to_owned(),
             },
             Message {
                 role: "user".to_owned(),
-                content: user_content,
+                content: user.to_owned(),
             },
         ],
     );
-    args.temperature = Some(EXTRACTION_TEMPERATURE);
+    args.temperature = Some(temperature);
 
     let response =
         client
@@ -135,26 +179,16 @@ pub async fn extract_memories_from_text(
         .ok_or_else(|| LlmExtractionError::ParseError("Empty response from LLM".to_string()))?
         .message
         .content
-        .trim();
+        .trim()
+        .to_string();
 
-    let extracted: ExtractedThoughts = serde_json::from_str(raw_content).map_err(|e| {
-        LlmExtractionError::ParseError(format!(
-            "LLM output is not valid JSON: {}\nRaw output: {}",
-            e, raw_content
-        ))
-    })?;
+    let usage = crate::TokenUsage {
+        prompt_tokens: response.usage.prompt_tokens,
+        completion_tokens: response.usage.completion_tokens,
+        total_tokens: response.usage.total_tokens,
+    };
 
-    let thoughts = validate_and_transform_thoughts(extracted.thoughts)?;
-
-    Ok(ExtractionResult {
-        thoughts,
-        model: response.model.unwrap_or(model),
-        usage: crate::TokenUsage {
-            prompt_tokens: response.usage.prompt_tokens,
-            completion_tokens: response.usage.completion_tokens,
-            total_tokens: response.usage.total_tokens,
-        },
-    })
+    Ok((raw_content, usage))
 }
 
 /// Validate extracted thought raw JSON and transform into [`ThoughtInput`] records.

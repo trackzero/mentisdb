@@ -43,8 +43,8 @@ fn summarizes_targets(chain: &MentisDb) -> Vec<Uuid> {
         .collect()
 }
 
-#[test]
-fn consolidation_produces_one_summary_per_uncovered_session_window() {
+#[tokio::test]
+async fn consolidation_produces_one_summary_per_uncovered_session_window() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "two-windows");
 
@@ -77,7 +77,9 @@ fn consolidation_produces_one_summary_per_uncovered_session_window() {
     );
 
     let before_len = chain.thoughts().len();
-    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
 
     assert_eq!(report.counts.consolidations, 2);
     // 2 summaries + 1 report thought.
@@ -123,8 +125,8 @@ fn consolidation_produces_one_summary_per_uncovered_session_window() {
     assert!(!a_summary.tags.contains(&"tag-beta finding one".to_string()));
 }
 
-#[test]
-fn consolidation_skips_a_fully_covered_window() {
+#[tokio::test]
+async fn consolidation_skips_a_fully_covered_window() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "covered-window");
 
@@ -172,7 +174,9 @@ fn consolidation_skips_a_fully_covered_window() {
         "uncovered finding two",
     );
 
-    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
 
     // Only session B's window should be newly consolidated.
     assert_eq!(report.counts.consolidations, 1);
@@ -185,8 +189,8 @@ fn consolidation_skips_a_fully_covered_window() {
     assert_eq!(targets.iter().filter(|id| **id == a2.id).count(), 1);
 }
 
-#[test]
-fn consolidation_never_targets_dream_role_or_invalidated_thoughts() {
+#[tokio::test]
+async fn consolidation_never_targets_dream_role_or_invalidated_thoughts() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "exclusions");
 
@@ -219,15 +223,17 @@ fn consolidation_never_targets_dream_role_or_invalidated_thoughts() {
         .unwrap();
     assert!(chain.is_invalidated(normal.id));
 
-    run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
 
     let targets = summarizes_targets(&chain);
     assert!(!targets.contains(&stray_dream.id));
     assert!(!targets.contains(&normal.id));
 }
 
-#[test]
-fn dry_run_reports_candidate_consolidations_but_appends_nothing() {
+#[tokio::test]
+async fn dry_run_reports_candidate_consolidations_but_appends_nothing() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "dry-run-consolidate");
 
@@ -246,14 +252,16 @@ fn dry_run_reports_candidate_consolidations_but_appends_nothing() {
     );
 
     let before_len = chain.thoughts().len();
-    let report = run_dream_pass(&mut chain, &DreamConfig::default(), true, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &DreamConfig::default(), true, &[])
+        .await
+        .unwrap();
 
     assert_eq!(report.counts.consolidations, 1);
     assert_eq!(chain.thoughts().len(), before_len);
 }
 
-#[test]
-fn consolidation_digest_is_capped_at_2000_chars() {
+#[tokio::test]
+async fn consolidation_digest_is_capped_at_2000_chars() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "long-digest");
 
@@ -268,7 +276,9 @@ fn consolidation_digest_is_capped_at_2000_chars() {
         );
     }
 
-    run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
 
     let summary = chain
         .thoughts()

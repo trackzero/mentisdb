@@ -7099,6 +7099,38 @@ impl MentisDb {
         self.managed_vector_sidecars.remove(metadata).is_some()
     }
 
+    /// Embed arbitrary text on demand using whichever provider is currently
+    /// managing `metadata`'s embedding space on this handle, without
+    /// persisting anything to the sidecar.
+    ///
+    /// Returns `Ok(None)` if no provider is currently managing that
+    /// embedding space. This reuses the exact same erased provider instance
+    /// [`Self::extend_fresh_vector_sidecar`] already uses to embed newly
+    /// appended thoughts, guaranteeing the returned vector is compatible with
+    /// the sidecar's existing entries (same model, same dimension).
+    ///
+    /// Used by Phase 2 dreaming's recombination novelty filter
+    /// (`crate::dream::recombine`) to check whether an LLM-generated
+    /// candidate is a near-duplicate of existing content, without appending
+    /// the candidate first.
+    pub(crate) fn embed_text_with_managed_provider(
+        &self,
+        metadata: &crate::search::EmbeddingMetadata,
+        text: &str,
+    ) -> io::Result<Option<Vec<f32>>> {
+        let Some(entry) = self.managed_vector_sidecars.get(metadata) else {
+            return Ok(None);
+        };
+        let mut documents =
+            entry
+                .provider
+                .embed_documents(&[crate::search::EmbeddingInput::new(
+                    "__novelty_check__",
+                    text,
+                )])?;
+        Ok(documents.pop().map(|document| document.vector))
+    }
+
     /// Return the embedding spaces currently managed for append-time vector
     /// sidecar synchronization on this handle.
     pub fn managed_vector_sidecars(&self) -> Vec<crate::search::EmbeddingMetadata> {

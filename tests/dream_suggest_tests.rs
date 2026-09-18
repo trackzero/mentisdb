@@ -81,8 +81,8 @@ fn suggestion_thoughts(chain: &MentisDb) -> Vec<&mentisdb::Thought> {
         .collect()
 }
 
-#[test]
-fn near_duplicate_same_agent_pair_with_sidecar_produces_one_suggestion() {
+#[tokio::test]
+async fn near_duplicate_same_agent_pair_with_sidecar_produces_one_suggestion() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "dedup-positive");
 
@@ -109,7 +109,9 @@ fn near_duplicate_same_agent_pair_with_sidecar_produces_one_suggestion() {
 
     chain.manage_vector_sidecar(BucketProvider::new()).unwrap();
 
-    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
     assert_eq!(report.counts.suggestions, 1);
 
     let suggestions = suggestion_thoughts(&chain);
@@ -129,8 +131,8 @@ fn near_duplicate_same_agent_pair_with_sidecar_produces_one_suggestion() {
     assert!(no_supersedes_invalidates_or_corrects(&chain));
 }
 
-#[test]
-fn same_pair_from_different_agents_produces_no_suggestion() {
+#[tokio::test]
+async fn same_pair_from_different_agents_produces_no_suggestion() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "dedup-cross-agent");
 
@@ -155,13 +157,15 @@ fn same_pair_from_different_agents_produces_no_suggestion() {
 
     chain.manage_vector_sidecar(BucketProvider::new()).unwrap();
 
-    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
     assert_eq!(report.counts.suggestions, 0);
     assert!(suggestion_thoughts(&chain).is_empty());
 }
 
-#[test]
-fn high_cosine_but_low_lexical_overlap_produces_no_suggestion() {
+#[tokio::test]
+async fn high_cosine_but_low_lexical_overlap_produces_no_suggestion() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "dedup-lexical-gate");
 
@@ -186,12 +190,14 @@ fn high_cosine_but_low_lexical_overlap_produces_no_suggestion() {
 
     chain.manage_vector_sidecar(BucketProvider::new()).unwrap();
 
-    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
     assert_eq!(report.counts.suggestions, 0);
 }
 
-#[test]
-fn high_lexical_overlap_but_low_cosine_produces_no_suggestion() {
+#[tokio::test]
+async fn high_lexical_overlap_but_low_cosine_produces_no_suggestion() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "dedup-cosine-gate");
 
@@ -216,12 +222,14 @@ fn high_lexical_overlap_but_low_cosine_produces_no_suggestion() {
 
     chain.manage_vector_sidecar(BucketProvider::new()).unwrap();
 
-    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
     assert_eq!(report.counts.suggestions, 0);
 }
 
-#[test]
-fn already_related_pair_is_skipped() {
+#[tokio::test]
+async fn already_related_pair_is_skipped() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "dedup-already-linked");
 
@@ -251,12 +259,14 @@ fn already_related_pair_is_skipped() {
 
     chain.manage_vector_sidecar(BucketProvider::new()).unwrap();
 
-    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
     assert_eq!(report.counts.suggestions, 0);
 }
 
-#[test]
-fn no_vector_sidecar_configured_skips_dedup_cleanly() {
+#[tokio::test]
+async fn no_vector_sidecar_configured_skips_dedup_cleanly() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "dedup-no-sidecar");
 
@@ -280,6 +290,8 @@ fn no_vector_sidecar_configured_skips_dedup_cleanly() {
         .unwrap();
 
     // No manage_vector_sidecar call: no embedding space is configured.
-    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
     assert_eq!(report.counts.suggestions, 0);
 }

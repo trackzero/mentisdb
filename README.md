@@ -2147,6 +2147,36 @@ suggest-don't-act, off by default).
   `DreamConfig.half_life_overrides_days`. `use_decay` only affects ranked
   search — `query()`/`recent_context`/`memory_markdown` are unaffected, and
   search-eval benchmarks are unchanged with it off (the default).
+- **LLM-assisted operations** (opt-in via `DreamConfig.llm: Some(LlmExtractionConfig)`;
+  everything above works with `llm: None`, the default):
+  - **Abstractive consolidation** upgrades a window's extractive digest into
+    an LLM-written gist (same window selection, same `Summarizes` relations),
+    tagged `dream:consolidation:llm` in addition to `dream:consolidation`,
+    at confidence ≤ 0.6. Any LLM failure falls back to the extractive digest.
+  - **Recombination** (the REM analog) clusters the scan window's
+    above-median-salience thoughts by shared tag/concept, finds pairs of
+    clusters whose vector centroids are distant (cosine ≤ 0.3), and asks the
+    LLM for at most a few non-obvious, testable connections between them.
+    Each accepted connection is a `Hypothesis`/`Idea`/`Wonder`/`Question`
+    `Dream` thought (confidence ≤ 0.4) with `DerivedFrom` relations to the
+    specific thoughts it cited — citations outside the shown set, unknown
+    types, and near-duplicates of existing content (cosine ≥ 0.9) are
+    rejected. Tagged `dream:recombination`.
+  - **Contradiction-check** looks at pairs of thoughts that are similar but
+    not near-duplicates (cosine in `[0.75, 0.95)`, just below the dedup
+    band) and asks the LLM whether they directly contradict each other. A
+    "yes" appends one `Surprise`/`Dream` thought (confidence 0.4) tagged
+    `dream:contradiction` with `RelatedTo` links to both — **never**
+    `Contradicts` itself, which is reserved for promotion.
+  - Recombination and contradiction-check share one LLM-call budget,
+    `DreamConfig.recombination_budget` (default 3 calls/pass, decremented on
+    every attempt including rejections); abstractive consolidation's calls
+    are bounded by the same `max_writes_per_pass` pool as extractive
+    consolidation and dedup. Treat `dream:recombination`/`dream:contradiction`
+    thoughts with more skepticism than `dream:suggestion` — they're
+    LLM-generated speculation, not a statistical/vector comparison.
+  - `run_dream_pass` is `async` because of this LLM path; with `llm: None`
+    no LLM code executes.
 
 ### Memory Scopes
 

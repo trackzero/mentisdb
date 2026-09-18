@@ -175,14 +175,16 @@ fn dream_config_default_is_off() {
 // run_dream_pass: watermark, dry_run, budgets, provenance
 // ---------------------------------------------------------------------
 
-#[test]
-fn dry_run_appends_nothing_but_reflects_the_would_be_scan() {
+#[tokio::test]
+async fn dry_run_appends_nothing_but_reflects_the_would_be_scan() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "dry-run");
     append_role(&mut chain, ThoughtRole::Memory, "some memory");
 
     let before_len = chain.thoughts().len();
-    let report = run_dream_pass(&mut chain, &DreamConfig::default(), true, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &DreamConfig::default(), true, &[])
+        .await
+        .unwrap();
 
     assert_eq!(chain.thoughts().len(), before_len);
     assert!(report.dry_run);
@@ -190,14 +192,16 @@ fn dry_run_appends_nothing_but_reflects_the_would_be_scan() {
     assert_eq!(report.scanned_count, before_len as u64);
 }
 
-#[test]
-fn a_real_pass_appends_exactly_one_report_thought_and_registers_the_dreamer() {
+#[tokio::test]
+async fn a_real_pass_appends_exactly_one_report_thought_and_registers_the_dreamer() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "real-pass");
     append_role(&mut chain, ThoughtRole::Memory, "some memory");
 
     let before_len = chain.thoughts().len();
-    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
 
     assert!(!report.dry_run);
     assert_eq!(chain.thoughts().len(), before_len + 1);
@@ -213,16 +217,20 @@ fn a_real_pass_appends_exactly_one_report_thought_and_registers_the_dreamer() {
         .any(|agent| agent.agent_id == "mentis-dreamer"));
 }
 
-#[test]
-fn a_second_immediate_pass_scans_an_empty_window() {
+#[tokio::test]
+async fn a_second_immediate_pass_scans_an_empty_window() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "second-pass");
     append_role(&mut chain, ThoughtRole::Memory, "some memory");
 
-    let first = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    let first = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
     let after_first_len = chain.thoughts().len();
 
-    let second = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    let second = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
 
     assert_eq!(second.scan_start_index, first.high_water_index);
     assert_eq!(second.scan_start_index, second.scan_end_index);
@@ -231,8 +239,8 @@ fn a_second_immediate_pass_scans_an_empty_window() {
     assert_eq!(chain.thoughts().len(), after_first_len + 1);
 }
 
-#[test]
-fn first_pass_on_a_long_chain_starts_from_head_minus_max_scan() {
+#[tokio::test]
+async fn first_pass_on_a_long_chain_starts_from_head_minus_max_scan() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "long-chain");
     for i in 0..10 {
@@ -244,14 +252,16 @@ fn first_pass_on_a_long_chain_starts_from_head_minus_max_scan() {
         ..DreamConfig::default()
     };
 
-    let report = run_dream_pass(&mut chain, &config, true, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &config, true, &[])
+        .await
+        .unwrap();
 
     assert_eq!(report.scan_start_index, head - 3);
     assert_eq!(report.scan_end_index, head);
 }
 
-#[test]
-fn first_pass_on_a_short_chain_starts_from_zero() {
+#[tokio::test]
+async fn first_pass_on_a_short_chain_starts_from_zero() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "short-chain");
     append_role(&mut chain, ThoughtRole::Memory, "one memory");
@@ -260,13 +270,15 @@ fn first_pass_on_a_short_chain_starts_from_zero() {
         ..DreamConfig::default()
     };
 
-    let report = run_dream_pass(&mut chain, &config, true, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &config, true, &[])
+        .await
+        .unwrap();
 
     assert_eq!(report.scan_start_index, 0);
 }
 
-#[test]
-fn unknown_phase_names_are_rejected() {
+#[tokio::test]
+async fn unknown_phase_names_are_rejected() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "bad-phase");
     let result = run_dream_pass(
@@ -274,13 +286,14 @@ fn unknown_phase_names_are_rejected() {
         &DreamConfig::default(),
         true,
         &["not-a-real-phase".to_string()],
-    );
+    )
+    .await;
     assert!(result.is_err());
     assert_eq!(chain.thoughts().len(), 0);
 }
 
-#[test]
-fn known_phase_names_are_accepted_and_echoed_back() {
+#[tokio::test]
+async fn known_phase_names_are_accepted_and_echoed_back() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "good-phase");
     let report = run_dream_pass(
@@ -289,29 +302,34 @@ fn known_phase_names_are_accepted_and_echoed_back() {
         true,
         &["consolidate".to_string(), "decay".to_string()],
     )
+    .await
     .unwrap();
     assert_eq!(report.phases, vec!["consolidate", "decay"]);
 }
 
-#[test]
-fn max_writes_per_pass_of_zero_does_not_panic() {
+#[tokio::test]
+async fn max_writes_per_pass_of_zero_does_not_panic() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "zero-budget");
     let config = DreamConfig {
         max_writes_per_pass: 0,
         ..DreamConfig::default()
     };
-    let report = run_dream_pass(&mut chain, &config, false, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &config, false, &[])
+        .await
+        .unwrap();
     assert_eq!(report.counts, DreamPassCounts::default());
 }
 
-#[test]
-fn dream_pass_does_not_append_supersedes_invalidates_or_corrects() {
+#[tokio::test]
+async fn dream_pass_does_not_append_supersedes_invalidates_or_corrects() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "suggest-only");
     append_role(&mut chain, ThoughtRole::Memory, "existing memory");
 
-    run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
 
     for thought in chain.thoughts() {
         for relation in &thought.relations {
@@ -325,14 +343,18 @@ fn dream_pass_does_not_append_supersedes_invalidates_or_corrects() {
     }
 }
 
-#[test]
-fn chain_integrity_holds_after_a_dream_pass() {
+#[tokio::test]
+async fn chain_integrity_holds_after_a_dream_pass() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "integrity");
     append_role(&mut chain, ThoughtRole::Memory, "some memory");
 
-    run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
-    run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
+    run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
 
     assert!(chain.verify_integrity());
 }
@@ -341,8 +363,8 @@ fn chain_integrity_holds_after_a_dream_pass() {
 // Phase 1: combined budget, real-write integrity, decay-phase no-op
 // ---------------------------------------------------------------------
 
-#[test]
-fn max_writes_per_pass_caps_combined_consolidation_and_dedup_writes() {
+#[tokio::test]
+async fn max_writes_per_pass_caps_combined_consolidation_and_dedup_writes() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "combined-budget");
     // Five separate session-grouped windows, each independently
@@ -368,7 +390,9 @@ fn max_writes_per_pass_caps_combined_consolidation_and_dedup_writes() {
         max_writes_per_pass: 2,
         ..DreamConfig::default()
     };
-    let report = run_dream_pass(&mut chain, &config, false, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &config, false, &[])
+        .await
+        .unwrap();
 
     let total_writes = report.counts.consolidations + report.counts.suggestions;
     assert!(
@@ -377,8 +401,8 @@ fn max_writes_per_pass_caps_combined_consolidation_and_dedup_writes() {
     );
 }
 
-#[test]
-fn chain_integrity_holds_after_a_pass_with_real_consolidation_writes() {
+#[tokio::test]
+async fn chain_integrity_holds_after_a_pass_with_real_consolidation_writes() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "integrity-with-writes");
     let session = Uuid::new_v4();
@@ -393,7 +417,9 @@ fn chain_integrity_holds_after_a_pass_with_real_consolidation_writes() {
             .unwrap();
     }
 
-    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[]).unwrap();
+    let report = run_dream_pass(&mut chain, &DreamConfig::default(), false, &[])
+        .await
+        .unwrap();
     assert!(
         report.counts.consolidations > 0,
         "expected at least one consolidation to exercise integrity"
@@ -402,8 +428,8 @@ fn chain_integrity_holds_after_a_pass_with_real_consolidation_writes() {
     assert!(chain.verify_integrity());
 }
 
-#[test]
-fn phases_decay_only_performs_watermark_bookkeeping() {
+#[tokio::test]
+async fn phases_decay_only_performs_watermark_bookkeeping() {
     let dir = tempdir().unwrap();
     let mut chain = open_chain(dir.path(), "decay-phase-noop");
     let session = Uuid::new_v4();
@@ -425,6 +451,7 @@ fn phases_decay_only_performs_watermark_bookkeeping() {
         false,
         &["decay".to_string()],
     )
+    .await
     .unwrap();
 
     assert_eq!(report.counts, DreamPassCounts::default());

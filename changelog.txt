@@ -1,4 +1,55 @@
-0.10.8.54 SEP/17/2026 (feature/dreaming, Phase 0+1 — not yet released)
+0.10.8.54 SEP/18/2026 (feature/dreaming, Phase 0+1+2 — not yet released)
+  - feat(dreaming): Phase 2 — LLM-assisted abstractive consolidation,
+    recombination, and contradiction-check, on top of Phase 0+1's no-LLM
+    core. Opt-in via `DreamConfig.llm: Some(LlmExtractionConfig)`; with
+    `llm: None` (the default) no Phase 2 code executes. See
+    docs/dreaming-design.md's "Phase 2" section.
+    - `run_dream_pass` is now `async` (a breaking change to the Phase 0/1
+      signature) since the LLM client is async with no sync-bridging
+      precedent in this crate; every real caller (MCP/REST/scheduler)
+      already runs inside an async context.
+    - `crate::llm::chat_completion`: extracted from `extract_memories_from_text`
+      as a shared low-level chat-completion helper, reused by all three
+      Phase 2 LLM call sites. Behavior-preserving refactor.
+    - Abstractive consolidation (`dream::consolidate`): reuses Phase 1's
+      window selection; asks the LLM to rewrite the extractive bullets into
+      a coherent gist (confidence <= 0.6). Falls back to the extractive
+      digest on any LLM failure. Tagged `dream:consolidation:llm` in
+      addition to `dream:consolidation`.
+    - Recombination (`dream::recombine`, the REM analog): clusters the scan
+      window's above-median-salience thoughts by shared tag/concept, finds
+      cluster pairs with distant vector centroids (cosine <= 0.3), and asks
+      the LLM for at most a few non-obvious, testable connections. Output
+      is `Hypothesis`/`Idea`/`Wonder`/`Question`, `Dream`-role, confidence
+      <= 0.4, with `DerivedFrom` relations to cited sources. Validates the
+      type whitelist, content length, and that every citation resolves
+      within the labels shown to the model (rejecting the whole candidate
+      otherwise); a novelty filter embeds each candidate on the fly (new
+      `MentisDb::embed_text_with_managed_provider`) and rejects near-cosine
+      duplicates (>= 0.9) of existing window content.
+    - Contradiction-check (`dream::recombine`): for pairs in the
+      cosine `[0.75, 0.95)` band (similar but not dedup-flagged), asks the
+      LLM whether they directly contradict each other. A "yes" appends one
+      `Surprise`/`Dream` thought (confidence 0.4) tagged `dream:contradiction`
+      with `RelatedTo` links to both — never `Contradicts` itself.
+    - Recombination and contradiction-check share one LLM-call budget,
+      `DreamConfig::recombination_budget` (decremented on every call
+      attempt, including rejections, so a broken LLM can't stall a pass).
+      Abstractive consolidation's calls remain bounded by
+      `max_writes_per_pass`, the same dimension extractive consolidation
+      already uses.
+    - No mock-HTTP-server dependency added: a `pub(crate)` `ChatCompleter`
+      seam (`#[async_trait]`, matching the existing pattern already used by
+      `server::ToolProtocol`) lets tests inject canned responses; the real
+      path (`RealChatCompleter`) is what every production caller uses.
+  - test(dreaming): inline `#[tokio::test]` coverage in `dream::mod`/
+    `dream::recombine`/`dream::consolidate` for the no-LLM-core invariant
+    (a panicking completer proves it's never invoked when `llm: None`),
+    phase-gating exclusivity, budget enforcement, validation/rejection
+    logic (invalid JSON, out-of-range citations, confidence clamping,
+    novelty filtering), and chain integrity after a full LLM-assisted pass.
+    Existing Phase 0/1 test suites converted to `#[tokio::test]` for the
+    `run_dream_pass` async signature change (behavior unchanged).
   - feat(dreaming): Phase 1 — salience sampler, extractive consolidation,
     query-time decay, and dedup suggestions on top of Phase 0's scaffolding.
     Off by default; still no LLM dependency. See docs/dreaming-design.md.

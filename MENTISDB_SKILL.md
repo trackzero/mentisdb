@@ -126,6 +126,8 @@ Most resumable notes should be `Summary` with `role: Checkpoint`.
 
 **Treat `dream:suggestion`-tagged `Finding` thoughts as unconfirmed proposals, not settled facts.** A dream pass only ever suggests — a suggestion that thought A likely supersedes thought B is linked with `RelatedTo`, never `Supersedes`/`Invalidates`/`Corrects`. Don't chain further reasoning off one without independently verifying it or explicitly promoting it (appending a normal thought with `DerivedFrom` to confirm, or `Invalidates` to dismiss).
 
+**Treat `dream:recombination`- and `dream:contradiction`-tagged thoughts with even more skepticism than `dream:suggestion`.** They only exist when a dream pass is configured with an LLM (`DreamConfig.llm`) and are generated, not just statistically/vector-derived — a `Hypothesis`/`Idea`/`Wonder`/`Question` proposing a connection between two clusters, or a `Surprise` flagging a possible contradiction. Confidence is capped at 0.4 for exactly this reason. Verify independently before promoting; never treat one as ground truth on its own.
+
 ## 🔗 THOUGHT GRAPH
 
 Link via `refs: [index]` (intra-chain) or typed `relations` with `kind` and `target_id`:

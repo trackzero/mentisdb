@@ -4678,7 +4678,7 @@ impl MentisDbService {
         let chain = self.get_chain(Some(&chain_key), None).await?;
         let report = {
             let mut guard = chain.write().await;
-            crate::dream::run_dream_pass(&mut guard, &self.config.dream, dry_run, &phases)?
+            crate::dream::run_dream_pass(&mut guard, &self.config.dream, dry_run, &phases).await?
         };
 
         self.log_interaction(InteractionLogEntry {

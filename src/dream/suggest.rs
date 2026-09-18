@@ -23,7 +23,12 @@ use uuid::Uuid;
 const LEXICAL_OVERLAP_THRESHOLD: f32 = 0.5;
 /// Minimum vector cosine similarity for a pair to be considered a near
 /// duplicate, per the design doc's own fixed number (no config override).
-const COSINE_THRESHOLD: f32 = 0.95;
+///
+/// `pub(crate)` so `dream::recombine`'s contradiction-check can define its
+/// similarity band relative to this exact value (contradictions are
+/// "high-similarity pairs phase 1 did not flag as duplicates," i.e. below
+/// this threshold).
+pub(crate) const COSINE_THRESHOLD: f32 = 0.95;
 /// Confidence assigned to every dedup suggestion: a suggestion about two
 /// thoughts, not a digest of them, so deliberately below consolidation's 0.7
 /// extractive cap.
@@ -145,9 +150,7 @@ fn build_suggestion_input(
 ) -> ThoughtInput {
     let (winner, loser) = if a.importance > b.importance {
         (a, b)
-    } else if b.importance > a.importance {
-        (b, a)
-    } else if b.timestamp > a.timestamp {
+    } else if b.importance > a.importance || b.timestamp > a.timestamp {
         (b, a)
     } else {
         (a, b)

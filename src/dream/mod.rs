@@ -1,11 +1,13 @@
 //! Offline, idle-time consolidation ("dreaming") for MentisDB.
 //!
 //! Phase 0 provides the scaffolding — role, config, a watermarked pass
-//! report, and the trigger surface (MCP/REST/CLI, plus the idle scheduler
-//! in the `server`-gated [`scheduler`] submodule) — that later phases
-//! (salience sampling, extractive/LLM consolidation, decay, recombination)
-//! plug into. [`run_dream_pass`] itself performs no consolidation: it
-//! computes a resumable scan window and records a report, nothing else.
+//! report, and the trigger surface (MCP/REST/CLI, plus the idle scheduler in
+//! the `server`-gated [`scheduler`] submodule). Phase 1 ([`salience`],
+//! [`consolidate`], [`suggest`]) adds no-LLM extractive consolidation,
+//! query-time decay, and dedup suggestions. Phase 2 ([`recombine`],
+//! [`prompts`]) adds LLM-assisted abstractive consolidation, recombination,
+//! and contradiction-check, active only when [`DreamConfig::llm`] is
+//! configured — the no-LLM core (Phase 0/1 behavior) is otherwise unchanged.
 //!
 //! See `docs/dreaming-design.md` in the repository for the full design and
 //! its non-negotiables: storage stays append-only, the no-LLM core stays
@@ -13,13 +15,19 @@
 //! and everything is off by default.
 
 mod consolidate;
+mod prompts;
+mod recombine;
 pub mod salience;
 mod suggest;
 
 #[cfg(feature = "server")]
 pub mod scheduler;
 
-use crate::{MentisDb, ThoughtInput, ThoughtQuery, ThoughtRole, ThoughtType};
+use crate::{
+    LlmExtractionConfig, LlmExtractionError, MentisDb, ThoughtInput, ThoughtQuery, ThoughtRole,
+    ThoughtType, TokenUsage,
+};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -71,9 +79,10 @@ pub struct DreamConfig {
     pub max_scan: usize,
     /// Maximum number of thoughts a single pass may append.
     ///
-    /// Phase 0 never appends more than the one report thought, so this
-    /// bound is not yet exercised; it is validated here so Phase 1/2 have
-    /// an enforced budget to plug into.
+    /// Shared write budget for one pass: extractive/abstractive
+    /// consolidation, dedup suggestions, recombination, and contradiction
+    /// suggestions all draw from this one pool (in that order), each
+    /// decrementing it only on an actual append.
     pub max_writes_per_pass: usize,
     /// Chain key allowlist for the idle scheduler. Empty means the default
     /// chain only.
@@ -81,21 +90,31 @@ pub struct DreamConfig {
     /// Multiplier applied to a [`ThoughtRole::Dream`] thought's score in
     /// ranked search when it is included via `include_dreams`.
     pub dream_weight: f32,
-    /// Optional LLM configuration for Phase 2 (abstractive consolidation,
-    /// recombination). `None` keeps the pass fully LLM-free.
+    /// Optional LLM configuration. `None` keeps the pass fully LLM-free
+    /// (Phase 0/1 behavior only). `Some` additionally activates abstractive
+    /// consolidation, recombination, and contradiction-check.
     ///
     /// Never serialized: it may carry an API key, and [`DreamConfig::from_env`]
     /// re-reads it from the environment on every call rather than persisting
     /// it. A `DreamConfig` deserialized from JSON always has `llm: None`.
     #[serde(skip)]
     pub llm: Option<crate::LlmExtractionConfig>,
-    /// Maximum number of LLM recombination calls per pass (Phase 2).
+    /// Maximum number of LLM calls per pass across recombination and
+    /// contradiction-check combined (a shared pool — there is no separate
+    /// contradiction-check budget). Decremented on every call *attempt*,
+    /// including ones that end in rejection, so a broken or malicious LLM
+    /// can't stall a pass in an unbounded retry loop. Abstractive
+    /// consolidation's LLM calls are bounded separately, by
+    /// [`Self::max_writes_per_pass`], the same dimension extractive
+    /// consolidation already uses.
     pub recombination_budget: usize,
     /// Optional seed for deterministic sampling in later phases.
     ///
-    /// Not exercised in Phase 1: extractive consolidation and dedup
-    /// suggestions are a deterministic sort by salience, not a probabilistic
-    /// sample. Reserved for Phase 2's LLM-based recombination sampling.
+    /// Not exercised by any phase implemented so far: extractive/abstractive
+    /// consolidation, dedup suggestions, and recombination/contradiction
+    /// candidate selection are all deterministic sorts (by salience or
+    /// cosine similarity), never a probabilistic sample. Reserved for a
+    /// possible future phase.
     pub seed: Option<u64>,
     /// Per-[`crate::ThoughtType`] overrides for the query-time decay half-life
     /// table in [`salience::half_life_days`].
@@ -180,10 +199,10 @@ fn env_parsed<T: std::str::FromStr>(key: &str) -> Option<T> {
 
 /// Per-operation counters for one dream pass.
 ///
-/// Every field is `0` in Phase 0, since no consolidation, decay, or
-/// recombination logic exists yet. Later phases populate these as they add
-/// behavior; `#[serde(default)]` on each field lets old reports (serialized
-/// before a field existed) still deserialize.
+/// `recombinations`/`contradictions`/`rejections` stay `0` whenever
+/// `DreamConfig.llm` is `None`, since Phase 2 code never runs in that case.
+/// `#[serde(default)]` on each field lets old reports (serialized before a
+/// field existed) still deserialize.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DreamPassCounts {
     /// Extractive or abstractive consolidation summaries written.
@@ -192,13 +211,14 @@ pub struct DreamPassCounts {
     /// Dedup suggestions written.
     #[serde(default)]
     pub suggestions: u64,
-    /// Recombination outputs written (Phase 2).
+    /// Recombination outputs written.
     #[serde(default)]
     pub recombinations: u64,
-    /// Contradiction suggestions written (Phase 2).
+    /// Contradiction suggestions written.
     #[serde(default)]
     pub contradictions: u64,
-    /// LLM outputs rejected by validation (Phase 2).
+    /// LLM outputs rejected by validation (invalid JSON, disallowed type,
+    /// over-length content, unresolvable citations, or the novelty filter).
     #[serde(default)]
     pub rejections: u64,
 }
@@ -207,9 +227,9 @@ pub struct DreamPassCounts {
 ///
 /// Appended as an `Audit`-role `StateSnapshot` thought tagged
 /// [`DREAM_REPORT_TAG`] (the report itself is an audit record, not
-/// dream-authored content — only a pass's *output*, such as future
-/// consolidation summaries, is [`ThoughtRole::Dream`]). The next pass on the
-/// same chain reads the latest report to resume from
+/// dream-authored content — only a pass's *output*, such as consolidation
+/// summaries or recombination suggestions, is [`ThoughtRole::Dream`]). The
+/// next pass on the same chain reads the latest report to resume from
 /// [`DreamReport::high_water_index`], so the chain stays append-only and
 /// needs no side file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,29 +255,77 @@ pub struct DreamReport {
     pub high_water_index: u64,
     /// Number of thoughts observed in the scan window.
     pub scanned_count: u64,
-    /// LLM tokens consumed by this pass (Phase 2; always `0` in Phase 0).
+    /// LLM tokens consumed by this pass across abstractive consolidation,
+    /// recombination, and contradiction-check combined. Always `0` when
+    /// `DreamConfig.llm` is `None`.
     #[serde(default)]
     pub llm_tokens_used: u64,
     /// Per-operation counters.
     #[serde(default)]
     pub counts: DreamPassCounts,
     /// Phases requested for this pass, validated against
-    /// [`DREAM_PHASE_NAMES`] but not yet acted upon.
+    /// [`DREAM_PHASE_NAMES`]. `"consolidate"` covers extractive/abstractive
+    /// consolidation and dedup; `"recombine"` covers recombination and
+    /// contradiction-check (only when `DreamConfig.llm` is set); `"decay"`
+    /// is a documented no-op here (decay is a query-time ranked-search
+    /// factor, not a pass-time operation).
     #[serde(default)]
     pub phases: Vec<String>,
+}
+
+/// Seam for the LLM call Phase 2 dreaming makes (abstractive consolidation,
+/// recombination, contradiction-check), so tests can inject canned responses
+/// instead of hitting a real OpenAI-compatible endpoint.
+///
+/// `#[async_trait]` is used rather than a hand-rolled boxed future — the same
+/// pattern already established for [`crate::server`]'s `ToolProtocol` trait —
+/// since `async-trait` is already a dependency and the completer is shared
+/// `dyn`-style across multiple call sites within one pass
+/// (`dream::recombine`'s recombination and contradiction-check paths, and
+/// `dream::consolidate`'s abstractive path).
+#[async_trait]
+pub(crate) trait ChatCompleter: Send + Sync {
+    async fn complete(
+        &self,
+        config: &LlmExtractionConfig,
+        system: &str,
+        user: &str,
+        temperature: f32,
+    ) -> Result<(String, TokenUsage), LlmExtractionError>;
+}
+
+/// The real completer used by every production caller: delegates to
+/// [`crate::llm::chat_completion`], the shared low-level LLM call helper.
+pub(crate) struct RealChatCompleter;
+
+#[async_trait]
+impl ChatCompleter for RealChatCompleter {
+    async fn complete(
+        &self,
+        config: &LlmExtractionConfig,
+        system: &str,
+        user: &str,
+        temperature: f32,
+    ) -> Result<(String, TokenUsage), LlmExtractionError> {
+        crate::llm::chat_completion(config, system, user, temperature).await
+    }
 }
 
 /// Run one dream pass against `db`.
 ///
 /// Registers the [`DREAM_AGENT_ID`] agent, computes a resumable scan window
 /// from the latest pass report (or `max(0, head - max_scan)` on a chain's
-/// first pass), and — unless `dry_run` is set — appends a new report.
-/// Phase 0 performs no consolidation, decay, or recombination: the scan
-/// window is bookkeeping for later phases to plug into.
+/// first pass), and — unless `dry_run` is set — appends a new report. Runs
+/// extractive consolidation and dedup suggestions (Phase 1) unconditionally,
+/// and, only when [`DreamConfig::llm`] is configured, abstractive
+/// consolidation, recombination, and contradiction-check (Phase 2). This
+/// function is `async` because Phase 2's LLM calls are; with `config.llm:
+/// None` no `.await` point other than the initial call itself is ever
+/// reached, and behavior is identical to Phase 0/1.
 ///
-/// Dream-written thoughts are never cryptographically signed in Phase 0:
-/// nothing in [`DreamConfig`] supplies key material, and signing elsewhere
-/// in this crate is entirely caller-driven (see
+/// Dream-written thoughts are never cryptographically signed: nothing in
+/// [`DreamConfig`] supplies key material, and signing elsewhere in this crate
+/// is entirely caller-driven (see
 /// [`crate::ThoughtInput::with_thought_signature`]). Provenance is still
 /// fully carried by role, agent id, tags, and relations.
 ///
@@ -272,23 +340,40 @@ pub struct DreamReport {
 /// use mentisdb::dream::{run_dream_pass, DreamConfig};
 /// use mentisdb::{MentisDb, StorageAdapterKind};
 ///
-/// # fn main() -> std::io::Result<()> {
+/// # #[tokio::main]
+/// # async fn main() -> std::io::Result<()> {
 /// let dir = std::env::temp_dir().join("mentisdb_dream_doctest");
 /// let mut chain =
 ///     MentisDb::open_with_key_and_storage_kind(&dir, "dream-doctest", StorageAdapterKind::Binary)?;
 ///
-/// let report = run_dream_pass(&mut chain, &DreamConfig::default(), true, &[])?;
+/// let report = run_dream_pass(&mut chain, &DreamConfig::default(), true, &[]).await?;
 /// assert!(report.dry_run);
 /// assert_eq!(chain.thoughts().len(), 0); // dry runs append nothing
 /// # let _ = std::fs::remove_dir_all(&dir);
 /// # Ok(())
 /// # }
 /// ```
-pub fn run_dream_pass(
+pub async fn run_dream_pass(
     db: &mut MentisDb,
     config: &DreamConfig,
     dry_run: bool,
     phases: &[String],
+) -> io::Result<DreamReport> {
+    run_dream_pass_with_completer(db, config, dry_run, phases, &RealChatCompleter).await
+}
+
+/// Test-only (well, `pub(crate)`-only) entry point that lets callers inject a
+/// [`ChatCompleter`] instead of the real LLM client. [`run_dream_pass`]
+/// itself always calls this with [`RealChatCompleter`]; unit/integration
+/// tests call it directly with a canned completer so Phase 2's validation,
+/// budget, and novelty-filter logic can be exercised without any real
+/// network I/O.
+pub(crate) async fn run_dream_pass_with_completer(
+    db: &mut MentisDb,
+    config: &DreamConfig,
+    dry_run: bool,
+    phases: &[String],
+    completer: &dyn ChatCompleter,
 ) -> io::Result<DreamReport> {
     for phase in phases {
         if !DREAM_PHASE_NAMES.contains(&phase.as_str()) {
@@ -319,35 +404,73 @@ pub fn run_dream_pass(
     };
     let scanned_count = scan_end_index.saturating_sub(scan_start_index);
 
-    // "consolidate" bundles both extractive consolidation and dedup
-    // suggestions — the design and kickoff describe Phase 1 as one coherent
-    // no-LLM unit, and `DREAM_PHASE_NAMES` has no separate name for dedup.
-    // "decay" is a documented no-op here: decay is a query-time ranked-search
-    // factor (`RankedSearchQuery::use_decay`), not a pass-time operation, so
-    // naming it in `phases` has no effect on what a pass writes.
+    // "consolidate" covers extractive/abstractive consolidation and dedup
+    // suggestions — Phase 1 already bundled dedup under this name since
+    // `DREAM_PHASE_NAMES` has no separate entry for it; abstractive
+    // consolidation (when `config.llm` is set) is the same phase, just a
+    // better digest. "decay" is a documented no-op here: decay is a
+    // query-time ranked-search factor (`RankedSearchQuery::use_decay`), not a
+    // pass-time operation. "recombine" covers BOTH recombination and
+    // contradiction-check (Phase 2's other LLM-assisted work), gated
+    // additionally on `config.llm.is_some()` since neither can run without
+    // an LLM.
     let run_consolidate = phases.is_empty() || phases.iter().any(|p| p == "consolidate");
+    let run_recombine =
+        config.llm.is_some() && (phases.is_empty() || phases.iter().any(|p| p == "recombine"));
 
-    let mut remaining_budget = config.max_writes_per_pass;
+    let mut write_budget = config.max_writes_per_pass;
     let mut consolidations = Vec::new();
     let mut suggestions = Vec::new();
+    let mut consolidation_tokens = 0u64;
     if run_consolidate {
-        consolidations = consolidate::plan_consolidations(
+        let llm = config
+            .llm
+            .as_ref()
+            .map(|llm_config| (llm_config, completer));
+        let outcome = consolidate::plan_consolidations(
             db,
             config,
             scan_start_index,
             scan_end_index,
             pass_id,
-            remaining_budget,
-        );
-        remaining_budget = remaining_budget.saturating_sub(consolidations.len());
+            write_budget,
+            llm,
+        )
+        .await;
+        consolidations = outcome.inputs;
+        consolidation_tokens = outcome.tokens_used;
+        write_budget = write_budget.saturating_sub(consolidations.len());
         suggestions = suggest::plan_dedup_suggestions(
             db,
             config,
             scan_start_index,
             scan_end_index,
             pass_id,
-            remaining_budget,
+            write_budget,
         );
+        write_budget = write_budget.saturating_sub(suggestions.len());
+    }
+
+    let mut exploratory = recombine::Phase2ExploratoryOutcome::default();
+    if run_recombine {
+        // `run_recombine` is only true when `config.llm.is_some()`, so this
+        // unwrap is always reached with a real config.
+        let llm_config = config
+            .llm
+            .as_ref()
+            .expect("run_recombine implies llm.is_some()");
+        exploratory = recombine::plan_recombination_and_contradictions(
+            db,
+            config,
+            llm_config,
+            completer,
+            scan_start_index,
+            scan_end_index,
+            pass_id,
+            write_budget,
+            config.recombination_budget,
+        )
+        .await;
     }
 
     let mut report = DreamReport {
@@ -360,11 +483,13 @@ pub fn run_dream_pass(
         scan_end_index,
         high_water_index: scan_end_index,
         scanned_count,
-        llm_tokens_used: 0,
+        llm_tokens_used: consolidation_tokens + exploratory.tokens_used,
         counts: DreamPassCounts {
             consolidations: consolidations.len() as u64,
             suggestions: suggestions.len() as u64,
-            ..DreamPassCounts::default()
+            recombinations: exploratory.recombinations.len() as u64,
+            contradictions: exploratory.contradictions.len() as u64,
+            rejections: exploratory.rejections,
         },
         phases: phases.to_vec(),
     };
@@ -374,18 +499,27 @@ pub fn run_dream_pass(
         return Ok(report);
     }
 
-    for input in consolidations.into_iter().chain(suggestions) {
+    for input in consolidations
+        .into_iter()
+        .chain(suggestions)
+        .chain(exploratory.recombinations)
+        .chain(exploratory.contradictions)
+    {
         db.append_thought(DREAM_AGENT_ID, input)?;
     }
 
     // This pass is about to append its own report thought, plus whatever
-    // consolidation/suggestion thoughts it just wrote above. Advance the
-    // watermark past all of them so the next pass's scan window doesn't
-    // re-count them as new activity to consolidate — otherwise a chain with
-    // no other appends between passes would never see a truly empty window,
-    // and dreams could end up "consolidating" their own prior output.
-    report.high_water_index =
-        scan_end_index + 1 + report.counts.consolidations + report.counts.suggestions;
+    // consolidation/suggestion/recombination/contradiction thoughts it just
+    // wrote above. Advance the watermark past all of them so the next pass's
+    // scan window doesn't re-count them as new activity — otherwise a chain
+    // with no other appends between passes would never see a truly empty
+    // window, and dreams could end up processing their own prior output.
+    report.high_water_index = scan_end_index
+        + 1
+        + report.counts.consolidations
+        + report.counts.suggestions
+        + report.counts.recombinations
+        + report.counts.contradictions;
     report.duration_ms = started_instant.elapsed().as_millis() as u64;
     let content = serde_json::to_string(&report)
         .map_err(|e| io::Error::other(format!("failed to serialize dream report: {e}")))?;
@@ -458,5 +592,276 @@ mod tests {
     fn dream_pass_counts_deserializes_from_empty_object_for_forward_compat() {
         let restored: DreamPassCounts = serde_json::from_str("{}").unwrap();
         assert_eq!(restored, DreamPassCounts::default());
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 2: ChatCompleter seam, no-LLM-core invariant, phase gating,
+    // budget, and end-to-end wiring. These live here (not in a `tests/*.rs`
+    // integration file) because `ChatCompleter`/`run_dream_pass_with_completer`
+    // are `pub(crate)` test seams, invisible to external test crates.
+    // -----------------------------------------------------------------
+
+    use crate::{StorageAdapterKind, ThoughtInput, ThoughtType};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    fn open_chain(dir: &std::path::Path, key: &str) -> MentisDb {
+        MentisDb::open_with_key_and_storage_kind(dir, key, StorageAdapterKind::Binary).unwrap()
+    }
+
+    /// Fails the test immediately if invoked. Used to prove `config.llm:
+    /// None` means Phase 2 code never constructs or calls a completer.
+    struct PanicCompleter;
+
+    #[async_trait]
+    impl ChatCompleter for PanicCompleter {
+        async fn complete(
+            &self,
+            _config: &LlmExtractionConfig,
+            _system: &str,
+            _user: &str,
+            _temperature: f32,
+        ) -> Result<(String, TokenUsage), LlmExtractionError> {
+            panic!("ChatCompleter::complete must never be called when DreamConfig.llm is None");
+        }
+    }
+
+    /// Returns a canned JSON response keyed by which system persona asked,
+    /// and counts total calls made (for budget assertions).
+    struct ScriptedCompleter {
+        calls: AtomicUsize,
+        consolidation_response: Mutex<String>,
+        recombination_response: Mutex<String>,
+        contradiction_response: Mutex<String>,
+    }
+
+    impl ScriptedCompleter {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                consolidation_response: Mutex::new(
+                    r#"{"summary": "an llm-rewritten gist"}"#.to_string(),
+                ),
+                recombination_response: Mutex::new(r#"{"connections": []}"#.to_string()),
+                contradiction_response: Mutex::new(r#"{"contradicts": false}"#.to_string()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ChatCompleter for ScriptedCompleter {
+        async fn complete(
+            &self,
+            _config: &LlmExtractionConfig,
+            system: &str,
+            _user: &str,
+            _temperature: f32,
+        ) -> Result<(String, TokenUsage), LlmExtractionError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let raw = if system == prompts::CONSOLIDATION_SYSTEM {
+                self.consolidation_response.lock().unwrap().clone()
+            } else if system == prompts::RECOMBINATION_SYSTEM {
+                self.recombination_response.lock().unwrap().clone()
+            } else {
+                self.contradiction_response.lock().unwrap().clone()
+            };
+            Ok((raw, TokenUsage::default()))
+        }
+    }
+
+    fn test_llm_config() -> LlmExtractionConfig {
+        LlmExtractionConfig {
+            base_url: "http://localhost:0".to_string(),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+        }
+    }
+
+    fn append_finding(chain: &mut MentisDb, session: Uuid, content: &str) -> crate::Thought {
+        chain
+            .append_thought(
+                "agent",
+                ThoughtInput::new(ThoughtType::Finding, content)
+                    .with_session_id(session)
+                    .with_importance(0.7),
+            )
+            .unwrap()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn config_llm_none_never_invokes_the_completer() {
+        let dir = tempdir().unwrap();
+        let mut chain = open_chain(dir.path(), "no-llm-core");
+        let session = Uuid::new_v4();
+        append_finding(&mut chain, session, "one finding");
+        append_finding(&mut chain, session, "another finding");
+
+        // DreamConfig::default() has llm: None. If any Phase 2 code path
+        // were mistakenly reached, PanicCompleter would abort the test.
+        let report = run_dream_pass_with_completer(
+            &mut chain,
+            &DreamConfig::default(),
+            false,
+            &[],
+            &PanicCompleter,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.counts.recombinations, 0);
+        assert_eq!(report.counts.contradictions, 0);
+        assert_eq!(report.llm_tokens_used, 0);
+    }
+
+    #[tokio::test]
+    async fn phase_consolidate_alone_does_not_run_recombine_even_with_llm_set() {
+        let dir = tempdir().unwrap();
+        let mut chain = open_chain(dir.path(), "phase-consolidate-only");
+        let session = Uuid::new_v4();
+        append_finding(&mut chain, session, "consolidate-only finding one");
+        append_finding(&mut chain, session, "consolidate-only finding two");
+
+        let config = DreamConfig {
+            llm: Some(test_llm_config()),
+            ..DreamConfig::default()
+        };
+        let completer = ScriptedCompleter::new();
+        let report = run_dream_pass_with_completer(
+            &mut chain,
+            &config,
+            false,
+            &["consolidate".to_string()],
+            &completer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.counts.recombinations, 0);
+        assert_eq!(report.counts.contradictions, 0);
+    }
+
+    #[tokio::test]
+    async fn phase_recombine_alone_does_not_run_consolidation_or_dedup() {
+        let dir = tempdir().unwrap();
+        let mut chain = open_chain(dir.path(), "phase-recombine-only");
+        let session = Uuid::new_v4();
+        append_finding(&mut chain, session, "recombine-only finding one");
+        append_finding(&mut chain, session, "recombine-only finding two");
+
+        let config = DreamConfig {
+            llm: Some(test_llm_config()),
+            ..DreamConfig::default()
+        };
+        let completer = ScriptedCompleter::new();
+        let report = run_dream_pass_with_completer(
+            &mut chain,
+            &config,
+            false,
+            &["recombine".to_string()],
+            &completer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.counts.consolidations, 0);
+        assert_eq!(report.counts.suggestions, 0);
+    }
+
+    #[tokio::test]
+    async fn abstractive_consolidation_upgrades_the_digest_and_tags_it() {
+        let dir = tempdir().unwrap();
+        let mut chain = open_chain(dir.path(), "abstractive-consolidation");
+        let session = Uuid::new_v4();
+        append_finding(&mut chain, session, "abstractive finding one");
+        append_finding(&mut chain, session, "abstractive finding two");
+
+        let config = DreamConfig {
+            llm: Some(test_llm_config()),
+            ..DreamConfig::default()
+        };
+        let completer = ScriptedCompleter::new();
+        let report = run_dream_pass_with_completer(&mut chain, &config, false, &[], &completer)
+            .await
+            .unwrap();
+
+        assert_eq!(report.counts.consolidations, 1);
+        let summary = chain
+            .thoughts()
+            .iter()
+            .find(|t| t.role == ThoughtRole::Dream && t.thought_type == ThoughtType::Summary)
+            .unwrap();
+        assert_eq!(summary.content, "an llm-rewritten gist");
+        assert!(summary
+            .tags
+            .contains(&"dream:consolidation:llm".to_string()));
+        assert!(summary.confidence.unwrap() <= 0.6);
+        assert!(completer.call_count() >= 1);
+    }
+
+    #[tokio::test]
+    async fn recombination_budget_caps_total_completer_calls() {
+        let dir = tempdir().unwrap();
+        let mut chain = open_chain(dir.path(), "recombination-budget");
+        // Several distinctly-tagged, cross-tagged thoughts so clustering has
+        // multiple candidate cluster pairs to consider, exceeding a budget
+        // of 1 if left uncapped.
+        for i in 0..6 {
+            chain
+                .append_thought(
+                    "agent",
+                    ThoughtInput::new(ThoughtType::Finding, format!("budget finding {i}"))
+                        .with_tags(vec![format!("tag-{i}")])
+                        .with_importance(0.9),
+                )
+                .unwrap();
+        }
+
+        let config = DreamConfig {
+            llm: Some(test_llm_config()),
+            recombination_budget: 1,
+            ..DreamConfig::default()
+        };
+        let completer = ScriptedCompleter::new();
+        run_dream_pass_with_completer(
+            &mut chain,
+            &config,
+            false,
+            &["recombine".to_string()],
+            &completer,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            completer.call_count() <= 1,
+            "expected at most 1 completer call, got {}",
+            completer.call_count()
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_integrity_holds_after_a_full_llm_assisted_pass() {
+        let dir = tempdir().unwrap();
+        let mut chain = open_chain(dir.path(), "integrity-llm");
+        let session = Uuid::new_v4();
+        append_finding(&mut chain, session, "integrity finding one");
+        append_finding(&mut chain, session, "integrity finding two");
+
+        let config = DreamConfig {
+            llm: Some(test_llm_config()),
+            ..DreamConfig::default()
+        };
+        let completer = ScriptedCompleter::new();
+        run_dream_pass_with_completer(&mut chain, &config, false, &[], &completer)
+            .await
+            .unwrap();
+
+        assert!(chain.verify_integrity());
     }
 }
