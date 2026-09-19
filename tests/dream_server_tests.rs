@@ -281,3 +281,228 @@ async fn rest_dream_endpoint_dry_run_and_manual_trigger() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn mcp_promote_dream_tool_appends_memory_with_derived_from() {
+    let dir = unique_chain_dir();
+    let chain_key = "mcp-promote-dream";
+    let router = mcp_router(MentisDbServiceConfig::new(
+        dir.clone(),
+        chain_key,
+        StorageAdapterKind::Binary,
+    ));
+
+    let rest = rest_router(MentisDbServiceConfig::new(
+        dir.clone(),
+        chain_key,
+        StorageAdapterKind::Binary,
+    ));
+    let dream = append_thought(
+        rest,
+        chain_key,
+        "mentis-dreamer",
+        "Finding",
+        Some("Dream"),
+        "a dream finding",
+    )
+    .await;
+    let dream_id = dream["thought"]["id"].as_str().unwrap();
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tools/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "tool": "mentisdb_promote_dream",
+                        "parameters": { "chain_key": chain_key, "dream_id": dream_id, "agent_id": "reviewer" }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["result"]["success"], json!(true));
+    assert_eq!(json["result"]["output"]["thought"]["role"], json!("Memory"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn rest_promote_dream_uses_edited_content_when_given() {
+    let dir = unique_chain_dir();
+    let chain_key = "rest-promote-dream";
+    let router = rest_router(MentisDbServiceConfig::new(
+        dir.clone(),
+        chain_key,
+        StorageAdapterKind::Binary,
+    ));
+
+    let dream = append_thought(
+        router.clone(),
+        chain_key,
+        "mentis-dreamer",
+        "Finding",
+        Some("Dream"),
+        "original dream text",
+    )
+    .await;
+    let dream_id = dream["thought"]["id"].as_str().unwrap();
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/dreams/promote")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "chain_key": chain_key,
+                        "dream_id": dream_id,
+                        "agent_id": "reviewer",
+                        "edited_content": "cleaned-up text"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["thought"]["content"], json!("cleaned-up text"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn rest_promote_dream_returns_404_for_unknown_id() {
+    let dir = unique_chain_dir();
+    let chain_key = "rest-promote-missing";
+    let router = rest_router(MentisDbServiceConfig::new(
+        dir.clone(),
+        chain_key,
+        StorageAdapterKind::Binary,
+    ));
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/dreams/promote")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "chain_key": chain_key,
+                        "dream_id": uuid::Uuid::new_v4().to_string(),
+                        "agent_id": "reviewer"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn rest_promote_dream_returns_400_for_non_dream_role() {
+    let dir = unique_chain_dir();
+    let chain_key = "rest-promote-wrong-role";
+    let router = rest_router(MentisDbServiceConfig::new(
+        dir.clone(),
+        chain_key,
+        StorageAdapterKind::Binary,
+    ));
+
+    let normal = append_thought(
+        router.clone(),
+        chain_key,
+        "agent",
+        "Finding",
+        None,
+        "a normal finding",
+    )
+    .await;
+    let normal_id = normal["thought"]["id"].as_str().unwrap();
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/dreams/promote")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "chain_key": chain_key,
+                        "dream_id": normal_id,
+                        "agent_id": "reviewer"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn rest_dismiss_dream_appends_correction_with_invalidates() {
+    let dir = unique_chain_dir();
+    let chain_key = "rest-dismiss-dream";
+    let router = rest_router(MentisDbServiceConfig::new(
+        dir.clone(),
+        chain_key,
+        StorageAdapterKind::Binary,
+    ));
+
+    let dream = append_thought(
+        router.clone(),
+        chain_key,
+        "mentis-dreamer",
+        "Finding",
+        Some("Dream"),
+        "a dream suggestion",
+    )
+    .await;
+    let dream_id = dream["thought"]["id"].as_str().unwrap();
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/dreams/dismiss")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "chain_key": chain_key,
+                        "dream_id": dream_id,
+                        "agent_id": "reviewer",
+                        "reason": "not useful"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["thought"]["thought_type"], json!("Correction"));
+    assert_eq!(json["thought"]["role"], json!("Audit"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

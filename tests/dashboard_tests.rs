@@ -10,6 +10,7 @@ use axum::{
 };
 use dashmap::DashMap;
 pub use mentisdb::auth;
+pub use mentisdb::dream;
 pub use mentisdb::search;
 pub use mentisdb::{
     chain_storage_filename, deregister_chain, load_registered_chains, AgentStatus,
@@ -2156,6 +2157,199 @@ async fn pin_login_behind_https_proxy_sets_secure_cookie() {
         set_cookie.to_ascii_lowercase().contains("secure"),
         "cookie issued behind HTTPS proxy must have Secure attribute, got: {set_cookie}"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Phase 3 "dreaming" dashboard tests ──────────────────────────────────────
+
+async fn dashboard_body_json(response: axum::response::Response) -> Value {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn seed_chain_with_one_dream_pass(dir: &PathBuf, chain_key: &str) -> String {
+    let mut chain =
+        MentisDb::open_with_key_and_storage_kind(dir, chain_key, StorageAdapterKind::Binary)
+            .unwrap();
+    let session = uuid::Uuid::new_v4();
+    chain
+        .append_thought(
+            "agent",
+            ThoughtInput::new(ThoughtType::Finding, "alpha finding one")
+                .with_session_id(session)
+                .with_importance(0.8),
+        )
+        .unwrap();
+    chain
+        .append_thought(
+            "agent",
+            ThoughtInput::new(ThoughtType::Finding, "alpha finding two")
+                .with_session_id(session)
+                .with_importance(0.8),
+        )
+        .unwrap();
+    let report = mentisdb::dream::run_dream_pass(
+        &mut chain,
+        &mentisdb::dream::DreamConfig::default(),
+        false,
+        &[],
+    )
+    .await
+    .unwrap();
+    report.pass_id.to_string()
+}
+
+#[tokio::test]
+async fn dreams_endpoint_groups_report_and_outputs_by_pass() {
+    let dir = unique_chain_dir();
+    let chain_key = "dreams-grouped";
+    let pass_id = seed_chain_with_one_dream_pass(&dir, chain_key).await;
+
+    let router = dashboard_router_for_dir(&dir);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/dashboard/api/chains/{chain_key}/dreams"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = dashboard_body_json(response).await;
+    let passes = json["passes"].as_array().unwrap();
+    assert_eq!(passes.len(), 1);
+    assert_eq!(passes[0]["report"]["pass_id"], Value::String(pass_id));
+    let outputs = passes[0]["outputs"].as_array().unwrap();
+    assert_eq!(outputs.len(), 1, "one consolidation summary expected");
+    assert_eq!(outputs[0]["status"], "pending");
+    assert_eq!(outputs[0]["role"], "Dream");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn dashboard_promote_dream_marks_status_promoted() {
+    let dir = unique_chain_dir();
+    let chain_key = "dreams-promote";
+    seed_chain_with_one_dream_pass(&dir, chain_key).await;
+
+    let router = dashboard_router_for_dir(&dir);
+    let dream_id = {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/dashboard/api/chains/{chain_key}/dreams"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = dashboard_body_json(response).await;
+        json["passes"][0]["outputs"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let promote = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/dashboard/api/chains/{chain_key}/dreams/promote"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "dream_id": dream_id }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(promote.status(), StatusCode::OK);
+    let promote_json = dashboard_body_json(promote).await;
+    assert_eq!(promote_json["thought"]["role"], "Memory");
+    assert_eq!(promote_json["thought"]["agent_id"], "system");
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/dashboard/api/chains/{chain_key}/dreams"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = dashboard_body_json(response).await;
+    assert_eq!(json["passes"][0]["outputs"][0]["status"], "promoted");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn dashboard_dismiss_dream_marks_status_dismissed() {
+    let dir = unique_chain_dir();
+    let chain_key = "dreams-dismiss";
+    seed_chain_with_one_dream_pass(&dir, chain_key).await;
+
+    let router = dashboard_router_for_dir(&dir);
+    let dream_id = {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/dashboard/api/chains/{chain_key}/dreams"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = dashboard_body_json(response).await;
+        json["passes"][0]["outputs"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let dismiss = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/dashboard/api/chains/{chain_key}/dreams/dismiss"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "dream_id": dream_id, "reason": "not useful" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dismiss.status(), StatusCode::OK);
+    let dismiss_json = dashboard_body_json(dismiss).await;
+    assert_eq!(dismiss_json["thought"]["thought_type"], "Correction");
+    assert_eq!(dismiss_json["thought"]["role"], "Audit");
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/dashboard/api/chains/{chain_key}/dreams"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = dashboard_body_json(response).await;
+    assert_eq!(json["passes"][0]["outputs"][0]["status"], "dismissed");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

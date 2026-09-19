@@ -127,6 +127,15 @@ pub(crate) fn dashboard_router(state: DashboardState) -> Router {
         // Thoughts for a chain
         .route("/chains/{chain_key}/thoughts", get(api_chain_thoughts))
         .route("/chains/{chain_key}/search", get(api_chain_search))
+        .route("/chains/{chain_key}/dreams", get(api_chain_dreams))
+        .route(
+            "/chains/{chain_key}/dreams/promote",
+            post(api_chain_dreams_promote),
+        )
+        .route(
+            "/chains/{chain_key}/dreams/dismiss",
+            post(api_chain_dreams_dismiss),
+        )
         .route(
             "/chains/{chain_key}/search/bundles",
             get(api_chain_search_bundles),
@@ -883,6 +892,31 @@ struct ThoughtsQuery {
     order: Option<String>,
 }
 
+/// Query parameters for the dreams-by-pass endpoint.
+#[derive(Deserialize, Default)]
+struct DreamsQuery {
+    /// 1-based pass-page number (defaults to 1).
+    page: Option<usize>,
+    /// Passes per page (defaults to 20).
+    per_page: Option<usize>,
+}
+
+/// Request body for [`api_chain_dreams_promote`].
+#[derive(Deserialize)]
+struct DashboardPromoteDreamBody {
+    dream_id: Uuid,
+    edited_content: Option<String>,
+    agent_id: Option<String>,
+}
+
+/// Request body for [`api_chain_dreams_dismiss`].
+#[derive(Deserialize)]
+struct DashboardDismissDreamBody {
+    dream_id: Uuid,
+    reason: Option<String>,
+    agent_id: Option<String>,
+}
+
 /// Query parameters for chain-scoped dashboard search.
 #[derive(Deserialize, Default)]
 struct DashboardSearchQuery {
@@ -1379,6 +1413,151 @@ async fn api_chain_thoughts(
                 .unwrap_or(true)
         },
     )))
+}
+
+/// `GET /dashboard/api/chains/:chain_key/dreams`
+///
+/// Lists dream-pass reports and their output thoughts for one chain, grouped
+/// by pass (the shared `dream:pass:<uuid>` tag) and sorted newest-first.
+/// Pagination applies at the pass level, not the individual-thought level.
+/// Each output thought is annotated with its current review status:
+/// `"dismissed"` (invalidated), `"promoted"` (a later thought carries a
+/// `DerivedFrom` relation to it), or `"pending"` (neither).
+async fn api_chain_dreams(
+    State(state): State<DashboardState>,
+    Path(chain_key): Path<String>,
+    Query(params): Query<DreamsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let arc = get_or_open_chain(&state, &chain_key).await?;
+    let chain = arc.read().await;
+
+    let filter = ThoughtQuery::new()
+        .with_tags_any(["dream", "dream:report"])
+        .with_include_dreams(true)
+        .with_include_invalidated(true);
+    let candidates = chain.query(&filter);
+
+    let mut groups: BTreeMap<String, (Option<&Thought>, Vec<&Thought>)> = BTreeMap::new();
+    for thought in &candidates {
+        let Some(pass_tag) = thought
+            .tags
+            .iter()
+            .find(|tag| tag.starts_with("dream:pass:"))
+        else {
+            continue;
+        };
+        let entry = groups.entry(pass_tag.clone()).or_insert((None, Vec::new()));
+        if thought.tags.iter().any(|tag| tag == "dream:report") {
+            entry.0 = Some(thought);
+        } else {
+            entry.1.push(thought);
+        }
+    }
+
+    let mut passes: Vec<Value> = groups
+        .into_values()
+        .filter_map(|(report_thought, outputs)| {
+            let report_thought = report_thought?;
+            let report: crate::dream::DreamReport =
+                serde_json::from_str(&report_thought.content).ok()?;
+            let outputs_json: Vec<Value> = outputs
+                .iter()
+                .map(|thought| dream_output_json(&chain, thought))
+                .collect();
+            Some(json!({ "report": report, "outputs": outputs_json }))
+        })
+        .collect();
+
+    // Newest pass first.
+    passes.sort_by(|a, b| {
+        let a_started = a["report"]["started_at"].as_str().unwrap_or_default();
+        let b_started = b["report"]["started_at"].as_str().unwrap_or_default();
+        b_started.cmp(a_started)
+    });
+
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.per_page.unwrap_or(20).max(1);
+    let total = passes.len();
+    let pages = total.div_ceil(per_page);
+    let start = (page - 1) * per_page;
+    let page_slice: Vec<Value> = passes.into_iter().skip(start).take(per_page).collect();
+
+    Ok(Json(json!({
+        "passes": page_slice,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "pages": pages,
+    })))
+}
+
+/// Serialize one dream output thought plus its computed review status.
+fn dream_output_json(chain: &MentisDb, thought: &Thought) -> Value {
+    let status = if chain.is_invalidated(thought.id) {
+        "dismissed"
+    } else if chain.thoughts().iter().any(|other| {
+        other
+            .relations
+            .iter()
+            .any(|r| r.kind == ThoughtRelationKind::DerivedFrom && r.target_id == thought.id)
+    }) {
+        "promoted"
+    } else {
+        "pending"
+    };
+    json!({
+        "id": thought.id,
+        "thought_type": thought.thought_type,
+        "role": thought.role,
+        "tags": thought.tags,
+        "content": thought.content,
+        "confidence": thought.confidence,
+        "importance": thought.importance,
+        "relations": thought.relations,
+        "timestamp": thought.timestamp,
+        "status": status,
+    })
+}
+
+/// `POST /dashboard/api/chains/:chain_key/dreams/promote`
+///
+/// Dashboard-internal: calls [`MentisDb::promote_dream`] directly in-process,
+/// never proxying to the public `/v1/dreams/promote` REST route, matching
+/// every other dashboard mutation. `agent_id` defaults to `"system"` (the
+/// same convention [`api_bootstrap_chain`] uses) since the PIN gate
+/// authenticates a browser session, not an operator identity.
+async fn api_chain_dreams_promote(
+    State(state): State<DashboardState>,
+    Path(chain_key): Path<String>,
+    Json(body): Json<DashboardPromoteDreamBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let arc = get_or_open_chain(&state, &chain_key).await?;
+    let mut chain = arc.write().await;
+    let agent_id = body.agent_id.as_deref().unwrap_or("system");
+    let thought = chain
+        .promote_dream(agent_id, body.dream_id, body.edited_content.as_deref())
+        .map_err(skill_read_error)?
+        .clone();
+    Ok(Json(json!({ "thought": thought })))
+}
+
+/// `POST /dashboard/api/chains/:chain_key/dreams/dismiss`
+///
+/// Dashboard-internal counterpart to [`api_chain_dreams_promote`]; see its
+/// doc comment for the shared conventions.
+async fn api_chain_dreams_dismiss(
+    State(state): State<DashboardState>,
+    Path(chain_key): Path<String>,
+    Json(body): Json<DashboardDismissDreamBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let arc = get_or_open_chain(&state, &chain_key).await?;
+    let mut chain = arc.write().await;
+    let agent_id = body.agent_id.as_deref().unwrap_or("system");
+    let thought = chain
+        .dismiss_dream(agent_id, body.dream_id, body.reason.as_deref())
+        .map_err(skill_read_error)?
+        .clone();
+    Ok(Json(json!({ "thought": thought })))
 }
 
 /// `GET /dashboard/api/chains/:chain_key/search`

@@ -8884,6 +8884,135 @@ impl MentisDb {
         })
     }
 
+    /// Promote a [`ThoughtRole::Dream`] thought into a normal, trusted memory.
+    ///
+    /// Appends a new thought carrying the dream's own semantic
+    /// [`ThoughtType`] (only the role changes, from `Dream` to `Memory`),
+    /// linked back to the dream via a [`ThoughtRelationKind::DerivedFrom`]
+    /// relation. The dream thought itself is left untouched for audit — this
+    /// is a plain append, exactly like any other [`MentisDb::append_thought`]
+    /// call, with no new storage semantics.
+    ///
+    /// `content` defaults to the dream's own content when `edited_content`
+    /// is `None`, letting a reviewer promote a dream verbatim or with edits
+    /// in the same call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::NotFound`] if `dream_id` does not exist in
+    /// this chain, or [`io::ErrorKind::InvalidInput`] if it exists but is
+    /// not [`ThoughtRole::Dream`] (promoting/dismissing a non-dream thought
+    /// is very likely a caller bug).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use mentisdb::{MentisDb, ThoughtRole};
+    /// # fn main() -> std::io::Result<()> {
+    /// # let mut chain = MentisDb::open_with_key(&std::path::PathBuf::from("/tmp/tc_promote"), "c")?;
+    /// # let dream_id = chain.append("mentis-dreamer", mentisdb::ThoughtType::Finding, "a dream")?.id;
+    /// let promoted = chain.promote_dream("reviewer", dream_id, None)?;
+    /// assert_eq!(promoted.role, ThoughtRole::Memory);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn promote_dream(
+        &mut self,
+        agent_id: &str,
+        dream_id: Uuid,
+        edited_content: Option<&str>,
+    ) -> io::Result<&Thought> {
+        let dream = self.require_dream_thought(dream_id)?;
+        let thought_type = dream.thought_type;
+        let content = edited_content
+            .map(str::to_string)
+            .unwrap_or_else(|| dream.content.clone());
+        let input = ThoughtInput::new(thought_type, content)
+            .with_role(ThoughtRole::Memory)
+            .with_relations(vec![ThoughtRelation::new(
+                ThoughtRelationKind::DerivedFrom,
+                dream_id,
+            )]);
+        self.append_thought(agent_id, input)
+    }
+
+    /// Dismiss a [`ThoughtRole::Dream`] thought: an awake agent or human
+    /// reviewer has decided not to trust it.
+    ///
+    /// Appends an `Audit`-role [`ThoughtType::Correction`] thought carrying
+    /// `reason` (or a placeholder when `reason` is `None`), linked to the
+    /// dream via a [`ThoughtRelationKind::Invalidates`] relation. This is a
+    /// plain append — [`MentisDb::append_thought`] already updates
+    /// [`MentisDb::invalidated_thought_ids`] incrementally for any
+    /// invalidating relation, so `dream_id` is marked invalidated
+    /// immediately, with no new storage semantics.
+    ///
+    /// `ThoughtType::Correction` is a documented convention, not an
+    /// enforced constraint: dismissal is not LLM output, so it is not
+    /// subject to the type whitelist that governs Phase 2's generated
+    /// content.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`MentisDb::promote_dream`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use mentisdb::MentisDb;
+    /// # fn main() -> std::io::Result<()> {
+    /// # let mut chain = MentisDb::open_with_key(&std::path::PathBuf::from("/tmp/tc_dismiss"), "c")?;
+    /// # let dream_id = chain.append("mentis-dreamer", mentisdb::ThoughtType::Finding, "a dream")?.id;
+    /// chain.dismiss_dream("reviewer", dream_id, Some("not useful"))?;
+    /// assert!(chain.is_invalidated(dream_id));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn dismiss_dream(
+        &mut self,
+        agent_id: &str,
+        dream_id: Uuid,
+        reason: Option<&str>,
+    ) -> io::Result<&Thought> {
+        self.require_dream_thought(dream_id)?;
+        let content = reason
+            .map(str::to_string)
+            .unwrap_or_else(|| "Dismissed without a stated reason.".to_string());
+        let input = ThoughtInput::new(ThoughtType::Correction, content)
+            .with_role(ThoughtRole::Audit)
+            .with_relations(vec![ThoughtRelation::new(
+                ThoughtRelationKind::Invalidates,
+                dream_id,
+            )]);
+        self.append_thought(agent_id, input)
+    }
+
+    /// Look up `dream_id`, requiring it to exist and be [`ThoughtRole::Dream`].
+    ///
+    /// Shared validation for [`MentisDb::promote_dream`] and
+    /// [`MentisDb::dismiss_dream`].
+    fn require_dream_thought(&self, dream_id: Uuid) -> io::Result<&Thought> {
+        let Some(thought) = self.get_thought_by_id(dream_id) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "dream thought {dream_id} not found in chain '{}'",
+                    self.chain_key()
+                ),
+            ));
+        };
+        if thought.role != ThoughtRole::Dream {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "thought {dream_id} is role {:?}, not Dream; only Dream-role thoughts can be promoted/dismissed",
+                    thought.role
+                ),
+            ));
+        }
+        Ok(thought)
+    }
+
     /// Select retrieval candidates with shared invalidation and optional
     /// point-in-time rules used by ranked search and context bundles.
     ///

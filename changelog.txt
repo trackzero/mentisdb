@@ -1,4 +1,31 @@
-0.10.8.54 SEP/18/2026 (feature/dreaming, Phase 0+1+2 — not yet released)
+0.10.8.54 SEP/18/2026 (feature/dreaming, Phase 0+1+2+3 — not yet released)
+  - feat(dreaming): Phase 3 — `promote_dream`/`dismiss_dream` helpers across
+    all four surfaces, plus the Dreams dashboard tab. Both are plain appends
+    (no new storage semantics): `promote_dream` appends a `Memory`-role
+    thought carrying the dream's own semantic type (or `edited_content`),
+    `DerivedFrom` the dream; `dismiss_dream` appends an `Audit`-role
+    `Correction` thought `Invalidates` the dream. The acting `agent_id` is
+    always caller-supplied, never `mentis-dreamer`.
+    - Library: `MentisDb::promote_dream`/`dismiss_dream`. `NotFound` for an
+      unknown id, `InvalidInput` for a non-`Dream`-role id. No "already
+      handled" guard — a repeat promote/dismiss on the same dream is just
+      another valid append.
+    - MCP: `mentisdb_promote_dream`/`mentisdb_dismiss_dream`, mirroring the
+      skill-deprecate/revoke tool shape.
+    - REST: `POST /v1/dreams/promote`/`dismiss`, body-carried `dream_id`.
+    - CLI: `mentisdb dream promote|dismiss <dream_id> --agent <id>
+      [--chain <key>] [--edited-content <text> | --reason <text>]`, new
+      sub-actions under the existing `dream` noun. `--agent` is required.
+    - Dashboard: a "Dreams" tab (`GET /dashboard/api/chains/:key/dreams`,
+      `.../dreams/promote`, `.../dreams/dismiss`, in-process calls, same
+      convention as every other dashboard mutation) lists dream passes
+      grouped by pass with each pass's report and output thoughts
+      (type/tag/status badges), a hand-rolled inline SVG bar chart of
+      thoughts-written-per-pass over time (no charting library — the
+      dashboard stays a single dependency-free `include_str!`'d file), and
+      Promote / Edit-and-promote / Dismiss actions per output thought.
+      Status (`pending`/`promoted`/`dismissed`) is computed at read time,
+      not stored.
   - feat(dreaming): Phase 2 — LLM-assisted abstractive consolidation,
     recombination, and contradiction-check, on top of Phase 0+1's no-LLM
     core. Opt-in via `DreamConfig.llm: Some(LlmExtractionConfig)`; with

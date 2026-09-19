@@ -7,8 +7,9 @@
 //! again without a failing test.
 
 use mentisdb::cli::{
-    build_add_body, build_dream_body, build_ranked_search_body, parse_args, AddCommand, CliCommand,
-    DreamCommand, SearchCommand,
+    build_add_body, build_dismiss_dream_body, build_dream_body, build_promote_dream_body,
+    build_ranked_search_body, parse_args, AddCommand, CliCommand, DreamCommand,
+    DreamDismissCommand, DreamPromoteCommand, SearchCommand,
 };
 
 fn add_command(content: &str, thought_type: Option<&str>) -> AddCommand {
@@ -190,5 +191,164 @@ fn parse_args_rejects_unknown_dream_phase() {
     assert!(
         error.contains("not-a-real-phase"),
         "unexpected error: {error}"
+    );
+}
+
+fn promote_command(
+    dream_id: &str,
+    agent: &str,
+    chain: Option<&str>,
+    edited_content: Option<&str>,
+) -> DreamPromoteCommand {
+    DreamPromoteCommand {
+        dream_id: dream_id.to_string(),
+        agent_id: agent.to_string(),
+        chain: chain.map(str::to_string),
+        edited_content: edited_content.map(str::to_string),
+        url: "http://127.0.0.1:9472".to_string(),
+    }
+}
+
+fn dismiss_command(
+    dream_id: &str,
+    agent: &str,
+    chain: Option<&str>,
+    reason: Option<&str>,
+) -> DreamDismissCommand {
+    DreamDismissCommand {
+        dream_id: dream_id.to_string(),
+        agent_id: agent.to_string(),
+        chain: chain.map(str::to_string),
+        reason: reason.map(str::to_string),
+        url: "http://127.0.0.1:9472".to_string(),
+    }
+}
+
+/// The promote body maps CLI fields onto the `POST /v1/dreams/promote` shape.
+#[test]
+fn promote_dream_body_maps_fields() {
+    let body = build_promote_dream_body(&promote_command(
+        "dream-1",
+        "reviewer",
+        Some("chain-1"),
+        Some("cleaned up"),
+    ));
+    assert_eq!(body["dream_id"], "dream-1");
+    assert_eq!(body["agent_id"], "reviewer");
+    assert_eq!(body["chain_key"], "chain-1");
+    assert_eq!(body["edited_content"], "cleaned up");
+}
+
+#[test]
+fn promote_dream_body_omits_absent_optional_fields() {
+    let body = build_promote_dream_body(&promote_command("dream-1", "reviewer", None, None));
+    assert!(body.get("chain_key").is_none());
+    assert!(body.get("edited_content").is_none());
+}
+
+/// The dismiss body maps CLI fields onto the `POST /v1/dreams/dismiss` shape.
+#[test]
+fn dismiss_dream_body_maps_fields() {
+    let body = build_dismiss_dream_body(&dismiss_command(
+        "dream-1",
+        "reviewer",
+        Some("chain-1"),
+        Some("not useful"),
+    ));
+    assert_eq!(body["dream_id"], "dream-1");
+    assert_eq!(body["agent_id"], "reviewer");
+    assert_eq!(body["chain_key"], "chain-1");
+    assert_eq!(body["reason"], "not useful");
+}
+
+#[test]
+fn dismiss_dream_body_omits_absent_optional_fields() {
+    let body = build_dismiss_dream_body(&dismiss_command("dream-1", "reviewer", None, None));
+    assert!(body.get("chain_key").is_none());
+    assert!(body.get("reason").is_none());
+}
+
+/// `mentisdb dream promote <id> --agent <id>` parses without disturbing the
+/// existing flag-only `dream` trigger syntax.
+#[test]
+fn parse_args_parses_dream_promote() {
+    let command = parse_args([
+        "mentisdb",
+        "dream",
+        "promote",
+        "dream-1",
+        "--agent",
+        "reviewer",
+        "--chain",
+        "chain-1",
+        "--edited-content",
+        "cleaned up",
+    ])
+    .unwrap();
+    assert_eq!(
+        command,
+        CliCommand::DreamPromote(DreamPromoteCommand {
+            dream_id: "dream-1".to_string(),
+            agent_id: "reviewer".to_string(),
+            chain: Some("chain-1".to_string()),
+            edited_content: Some("cleaned up".to_string()),
+            url: "http://127.0.0.1:9472".to_string(),
+        })
+    );
+}
+
+/// `mentisdb dream dismiss <id> --agent <id>` parses correctly.
+#[test]
+fn parse_args_parses_dream_dismiss() {
+    let command = parse_args([
+        "mentisdb",
+        "dream",
+        "dismiss",
+        "dream-1",
+        "--agent",
+        "reviewer",
+        "--reason",
+        "not useful",
+    ])
+    .unwrap();
+    assert_eq!(
+        command,
+        CliCommand::DreamDismiss(DreamDismissCommand {
+            dream_id: "dream-1".to_string(),
+            agent_id: "reviewer".to_string(),
+            chain: None,
+            reason: Some("not useful".to_string()),
+            url: "http://127.0.0.1:9472".to_string(),
+        })
+    );
+}
+
+/// `--agent` is required for promote/dismiss since the CLI has no other way
+/// to know who is running it.
+#[test]
+fn parse_args_requires_agent_for_dream_promote() {
+    let error = parse_args(["mentisdb", "dream", "promote", "dream-1"]).unwrap_err();
+    assert!(error.contains("--agent"), "unexpected error: {error}");
+}
+
+#[test]
+fn parse_args_requires_agent_for_dream_dismiss() {
+    let error = parse_args(["mentisdb", "dream", "dismiss", "dream-1"]).unwrap_err();
+    assert!(error.contains("--agent"), "unexpected error: {error}");
+}
+
+/// The existing flag-only `dream` trigger syntax is unaffected by adding
+/// `promote`/`dismiss` sub-actions.
+#[test]
+fn parse_args_dream_flag_only_syntax_still_works() {
+    let command = parse_args(["mentisdb", "dream", "--chain", "chain-1", "--dry-run"]).unwrap();
+    assert_eq!(
+        command,
+        CliCommand::Dream(DreamCommand {
+            chain: Some("chain-1".to_string()),
+            dry_run: true,
+            phase: None,
+            url: "http://127.0.0.1:9472".to_string(),
+        })
     );
 }

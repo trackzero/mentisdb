@@ -19,7 +19,8 @@ pub use args::{
     add_help_text, agents_help_text, backup_help_text, bearer_token_help_text, cert_help_text,
     dream_help_text, help_text, parse_args, restore_help_text, search_help_text, setup_help_text,
     wizard_help_text, AddCommand, AgentsCommand, BackupCommand, BearerTokenCommand, CertCommand,
-    CliCommand, DreamCommand, RestoreCommand, SearchCommand, SetupCommand, WizardCommand,
+    CliCommand, DreamCommand, DreamDismissCommand, DreamPromoteCommand, RestoreCommand,
+    SearchCommand, SetupCommand, WizardCommand,
 };
 pub use cert::{
     build_extra_sans, resolve_paths, run_cert, update_env_file, CERT_FILENAME, KEY_FILENAME,
@@ -121,6 +122,20 @@ where
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 let _ = writeln!(err, "dream failed: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Ok(CliCommand::DreamPromote(command)) => match run_dream_promote(&command, out, err) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let _ = writeln!(err, "dream promote failed: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Ok(CliCommand::DreamDismiss(command)) => match run_dream_dismiss(&command, out, err) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let _ = writeln!(err, "dream dismiss failed: {error}");
                 ExitCode::from(1)
             }
         },
@@ -430,6 +445,102 @@ pub fn build_dream_body(cmd: &DreamCommand) -> serde_json::Value {
 fn run_dream(cmd: &DreamCommand, out: &mut dyn Write, _err: &mut dyn Write) -> Result<(), String> {
     let body = build_dream_body(cmd);
     let url = format!("{}/v1/dream", cmd.url.trim_end_matches('/'));
+    let response = ureq::post(&url)
+        .send_json(body)
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    let json: serde_json::Value = response
+        .into_json()
+        .map_err(|e| format!("parse response: {e}"))?;
+    let _ = writeln!(
+        out,
+        "{}",
+        serde_json::to_string_pretty(&json).unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// Build the JSON body for the `dream promote` subcommand, matching
+/// `PromoteDreamRequest` in the REST API.
+pub fn build_promote_dream_body(cmd: &DreamPromoteCommand) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "dream_id".to_string(),
+        serde_json::Value::String(cmd.dream_id.clone()),
+    );
+    body.insert(
+        "agent_id".to_string(),
+        serde_json::Value::String(cmd.agent_id.clone()),
+    );
+    if let Some(ref chain) = cmd.chain {
+        body.insert(
+            "chain_key".to_string(),
+            serde_json::Value::String(chain.clone()),
+        );
+    }
+    if let Some(ref edited_content) = cmd.edited_content {
+        body.insert(
+            "edited_content".to_string(),
+            serde_json::Value::String(edited_content.clone()),
+        );
+    }
+    serde_json::Value::Object(body)
+}
+
+/// Build the JSON body for the `dream dismiss` subcommand, matching
+/// `DismissDreamRequest` in the REST API.
+pub fn build_dismiss_dream_body(cmd: &DreamDismissCommand) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "dream_id".to_string(),
+        serde_json::Value::String(cmd.dream_id.clone()),
+    );
+    body.insert(
+        "agent_id".to_string(),
+        serde_json::Value::String(cmd.agent_id.clone()),
+    );
+    if let Some(ref chain) = cmd.chain {
+        body.insert(
+            "chain_key".to_string(),
+            serde_json::Value::String(chain.clone()),
+        );
+    }
+    if let Some(ref reason) = cmd.reason {
+        body.insert(
+            "reason".to_string(),
+            serde_json::Value::String(reason.clone()),
+        );
+    }
+    serde_json::Value::Object(body)
+}
+
+fn run_dream_promote(
+    cmd: &DreamPromoteCommand,
+    out: &mut dyn Write,
+    _err: &mut dyn Write,
+) -> Result<(), String> {
+    let body = build_promote_dream_body(cmd);
+    let url = format!("{}/v1/dreams/promote", cmd.url.trim_end_matches('/'));
+    let response = ureq::post(&url)
+        .send_json(body)
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    let json: serde_json::Value = response
+        .into_json()
+        .map_err(|e| format!("parse response: {e}"))?;
+    let _ = writeln!(
+        out,
+        "{}",
+        serde_json::to_string_pretty(&json).unwrap_or_default()
+    );
+    Ok(())
+}
+
+fn run_dream_dismiss(
+    cmd: &DreamDismissCommand,
+    out: &mut dyn Write,
+    _err: &mut dyn Write,
+) -> Result<(), String> {
+    let body = build_dismiss_dream_body(cmd);
+    let url = format!("{}/v1/dreams/dismiss", cmd.url.trim_end_matches('/'));
     let response = ureq::post(&url)
         .send_json(body)
         .map_err(|e| format!("POST {url}: {e}"))?;

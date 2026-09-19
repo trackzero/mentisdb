@@ -464,6 +464,7 @@
     <div class="nav-links">
       <a href="#chains"   id="nav-chains" title="Browse all memory chains, their thoughts, and search indices">Chains</a>
       <a href="#agents"   id="nav-agents" title="View all agents that have written to any chain">Agents</a>
+      <a href="#dreams"   id="nav-dreams" title="Review offline dream-pass output: consolidations, suggestions, recombinations">Dreams</a>
       <a href="#skills"   id="nav-skills" title="Browse and manage agent skills and instructions">Skills</a>
       <a href="#bearer-tokens" id="nav-bearer-tokens" title="Manage MCP bearer-token access and scoped tokens">Bearer Tokens</a>
       <a href="#settings" id="nav-settings" style="color:#f0883e" title="Configure daemon environment variables and hot-reload settings">Settings</a>
@@ -802,6 +803,15 @@
 
   const TYPE_COLOR = {};
   TYPE_GROUPS.forEach(g => g.types.forEach(t => { TYPE_COLOR[t] = g.color; }));
+
+  const DREAM_TAG_COLORS = {
+    'dream:consolidation': 'blue',
+    'dream:consolidation:llm': 'blue',
+    'dream:suggestion': 'yellow',
+    'dream:recombination': 'purple',
+    'dream:contradiction': 'red',
+  };
+  const DREAM_STATUS_COLOR = { pending: 'gray', promoted: 'green', dismissed: 'red' };
 
   // =====================================================================
   // UTILITIES
@@ -1949,6 +1959,8 @@
     else if (parts[0] === 'agents' && parts[1] && parts[2]) renderAgentDetail(decodeURIComponent(parts[1]), decodeURIComponent(parts[2]));
     else if (parts[0] === 'agents' && parts[1])             renderAgentList(decodeURIComponent(parts[1]));
     else if (parts[0] === 'agents')                          renderAgentList();
+    else if (parts[0] === 'dreams' && parts[1])              renderDreams(decodeURIComponent(parts[1]));
+    else if (parts[0] === 'dreams')                          renderDreams();
     else if (parts[0] === 'skills' && parts[1])              renderSkillDetail(decodeURIComponent(parts[1]));
     else if (parts[0] === 'skills')                          renderSkillList();
     else if (parts[0] === 'bearer-tokens')                   renderBearerTokensPage();
@@ -2788,6 +2800,188 @@
       })
       .catch(err => errBox(el, err.message));
   }
+
+  // =====================================================================
+  // DREAMS
+  // =====================================================================
+  function dreamTagBadge(tag) {
+    const c = DREAM_TAG_COLORS[tag];
+    return c ? `<span class="badge badge-${c}">${esc(tag)}</span>` : '';
+  }
+
+  function dreamStatusBadge(status) {
+    const c = DREAM_STATUS_COLOR[status] || 'gray';
+    return `<span class="badge badge-${c}">${esc(status)}</span>`;
+  }
+
+  // Small hand-rolled SVG bar chart (no charting library, no CDN — matches
+  // the dashboard's self-contained, offline-first architecture). One bar per
+  // pass, oldest-first, height proportional to total thoughts written.
+  function dreamChartSvg(passes) {
+    const ordered = passes.slice().reverse();
+    const barWidth = 28, gap = 6, height = 60;
+    const values = ordered.map(p => {
+      const c = (p.report && p.report.counts) || {};
+      return (c.consolidations||0) + (c.suggestions||0) + (c.recombinations||0) + (c.contradictions||0);
+    });
+    const max = Math.max(1, ...values);
+    const svgWidth = Math.max(1, ordered.length) * (barWidth + gap);
+    const bars = ordered.map((p, i) => {
+      const v = values[i];
+      const barHeight = v > 0 ? Math.round((v / max) * (height - 4)) + 4 : 2;
+      const x = i * (barWidth + gap);
+      const y = height - barHeight;
+      const when = esc(fmtDate(p.report && p.report.started_at));
+      return `<rect x="${x}" y="${y}" width="${barWidth}" height="${barHeight}" rx="2" fill="#58a6ff"><title>${when}: ${v} thought(s) written</title></rect>`;
+    }).join('');
+    return `<svg viewBox="0 0 ${svgWidth} ${height}" width="${svgWidth}" height="${height}" style="max-width:100%">${bars}</svg>`;
+  }
+
+  function dreamOutputRowHtml(chainKey, output) {
+    const content = output.content || '';
+    const preview = content.length > 180 ? `${content.slice(0, 180)}…` : content;
+    const dreamTags = (output.tags || []).filter(t => DREAM_TAG_COLORS[t]).map(dreamTagBadge).join(' ');
+    const id = esc(output.id);
+    const ck = esc(chainKey);
+    const actions = output.status === 'pending' ? `
+      <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
+        <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation();window.promoteDream('${ck}','${id}')">Promote</button>
+        <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation();window.toggleEditPromote('${id}')">Edit &amp; Promote</button>
+        <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation();window.toggleDismiss('${id}')">Dismiss</button>
+      </div>
+      <div id="edit-promote-${id}" style="display:none;margin-top:6px">
+        <textarea id="edit-content-${id}" rows="3" style="width:100%">${esc(content)}</textarea>
+        <button class="btn btn-primary btn-sm" style="margin-top:4px" onclick="event.stopPropagation();window.confirmEditPromote('${ck}','${id}')">Confirm Promote</button>
+      </div>
+      <div id="dismiss-${id}" style="display:none;margin-top:6px">
+        <input type="text" id="dismiss-reason-${id}" placeholder="Reason (optional)" style="width:100%">
+        <button class="btn btn-danger btn-sm" style="margin-top:4px" onclick="event.stopPropagation();window.confirmDismiss('${ck}','${id}')">Confirm Dismiss</button>
+      </div>
+    ` : '';
+    return `
+      <div class="bundle-support-item clickable" data-dream-output-id="${id}">
+        <div>${typeBadge(output.thought_type)} ${dreamStatusBadge(output.status)} ${dreamTags}</div>
+        <div style="margin-top:4px">${esc(preview)}</div>
+        ${actions}
+      </div>
+    `;
+  }
+
+  function dreamPassCardHtml(chainKey, pass) {
+    const r = pass.report || {};
+    const c = r.counts || {};
+    const outputs = Array.isArray(pass.outputs) ? pass.outputs : [];
+    const passIdShort = esc(String(r.pass_id || '').slice(0, 8));
+    return `
+      <div class="bundle-card">
+        <h3 class="mono" style="font-size:0.9rem">Pass ${passIdShort} — ${esc(fmtDate(r.started_at))}${r.dry_run ? ' <span class="badge badge-gray">dry-run</span>' : ''}</h3>
+        <div class="bundle-seed-meta">
+          <span class="badge badge-blue">${esc(String(c.consolidations||0))} consolidations</span>
+          <span class="badge badge-yellow">${esc(String(c.suggestions||0))} suggestions</span>
+          <span class="badge badge-purple">${esc(String(c.recombinations||0))} recombinations</span>
+          <span class="badge badge-red">${esc(String(c.contradictions||0))} contradictions</span>
+          <span class="badge badge-gray">${esc(String(c.rejections||0))} rejected</span>
+          <span class="badge badge-gray">${esc(String(r.duration_ms||0))} ms</span>
+        </div>
+        <div class="bundle-support-list">
+          ${outputs.length ? outputs.map(o => dreamOutputRowHtml(chainKey, o)).join('') : '<div class="empty-state" style="padding:16px">No output thoughts recorded for this pass.</div>'}
+        </div>
+      </div>
+    `;
+  }
+
+  function loadDreamsForChain(chainKey, bodyEl) {
+    api(`/dashboard/api/chains/${encodeURIComponent(chainKey)}/dreams`)
+      .then(data => {
+        const passes = Array.isArray(data.passes) ? data.passes : [];
+        if (!passes.length) {
+          bodyEl.innerHTML = '<div class="empty-state">No dream passes yet for this chain.</div>';
+          return;
+        }
+        bodyEl.innerHTML = `
+          <div style="margin-bottom:10px">${dreamChartSvg(passes)}</div>
+          <div class="bundle-stack">${passes.map(p => dreamPassCardHtml(chainKey, p)).join('')}</div>
+        `;
+        bodyEl.querySelectorAll('.bundle-support-item.clickable').forEach(rowEl => {
+          rowEl.addEventListener('click', (evt) => {
+            if (evt.target.closest('button, textarea, input')) return;
+            const id = rowEl.getAttribute('data-dream-output-id');
+            const output = passes.flatMap(p => p.outputs || []).find(o => o.id === id);
+            if (output) openModal(output, chainKey);
+          });
+        });
+      })
+      .catch(err => errBox(bodyEl, err.message));
+  }
+
+  function renderDreams(targetChainKey = null) {
+    const app = document.getElementById('app');
+    app.innerHTML = `
+      <div class="page-header"><h1 title="Dream-pass output awaiting review: consolidations, dedup suggestions, LLM recombinations, and contradiction suggestions">Dreams</h1></div>
+      <div id="dreams-body"></div>
+    `;
+    const el = document.getElementById('dreams-body');
+    spinner(el);
+
+    api('/dashboard/api/chains')
+      .then(chains => {
+        if (!chains.length) { el.innerHTML = '<div class="empty-state">No chains found.</div>'; return; }
+        el.innerHTML = chains.map(c => {
+          const ck = c.chain_key || '';
+          return `
+            <div class="section-label" id="dream-chain-${encodeURIComponent(ck)}">Chain: ${esc(ck)}</div>
+            <div id="dream-body-${esc(ck)}"><div class="spinner-wrap"><div class="spinner"></div></div></div>
+          `;
+        }).join('');
+
+        if (targetChainKey) {
+          const target = document.getElementById(`dream-chain-${encodeURIComponent(targetChainKey)}`);
+          if (target) target.scrollIntoView({ behavior: 'auto', block: 'start' });
+        }
+
+        chains.forEach(c => {
+          const ck = c.chain_key || '';
+          const bodyEl = document.getElementById(`dream-body-${esc(ck)}`);
+          if (bodyEl) loadDreamsForChain(ck, bodyEl);
+        });
+      })
+      .catch(err => errBox(el, err.message));
+  }
+
+  window.promoteDream = function(chainKey, dreamId) {
+    api(`/dashboard/api/chains/${encodeURIComponent(chainKey)}/dreams/promote`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dream_id: dreamId }),
+    }).then(() => renderDreams(chainKey)).catch(err => alert(err.message));
+  };
+
+  window.toggleEditPromote = function(dreamId) {
+    const el = document.getElementById(`edit-promote-${dreamId}`);
+    if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+  };
+
+  window.confirmEditPromote = function(chainKey, dreamId) {
+    const textarea = document.getElementById(`edit-content-${dreamId}`);
+    const editedContent = textarea ? textarea.value : undefined;
+    api(`/dashboard/api/chains/${encodeURIComponent(chainKey)}/dreams/promote`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dream_id: dreamId, edited_content: editedContent }),
+    }).then(() => renderDreams(chainKey)).catch(err => alert(err.message));
+  };
+
+  window.toggleDismiss = function(dreamId) {
+    const el = document.getElementById(`dismiss-${dreamId}`);
+    if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+  };
+
+  window.confirmDismiss = function(chainKey, dreamId) {
+    const input = document.getElementById(`dismiss-reason-${dreamId}`);
+    const reason = input && input.value ? input.value : undefined;
+    api(`/dashboard/api/chains/${encodeURIComponent(chainKey)}/dreams/dismiss`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dream_id: dreamId, reason }),
+    }).then(() => renderDreams(chainKey)).catch(err => alert(err.message));
+  };
 
   // =====================================================================
   // AGENT DETAIL

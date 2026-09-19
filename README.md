@@ -2177,6 +2177,22 @@ suggest-don't-act, off by default).
     LLM-generated speculation, not a statistical/vector comparison.
   - `run_dream_pass` is `async` because of this LLM path; with `llm: None`
     no LLM code executes.
+- **Promotion ("waking up")**: an awake agent or human reviews a dream and
+  either promotes it (`promote_dream`) — a plain append of a `Memory`-role
+  thought carrying the dream's own content and semantic type, linked
+  `DerivedFrom` the dream — or dismisses it (`dismiss_dream`) — a plain
+  append of an `Audit`-role `Correction` thought linked `Invalidates` the
+  dream, which marks it invalidated immediately. Both leave the original
+  dream thought in place for audit; neither is a rewrite. Available as
+  `MentisDb::promote_dream`/`dismiss_dream` (library), `mentisdb_promote_dream`/
+  `mentisdb_dismiss_dream` (MCP), `POST /v1/dreams/promote`/`dismiss` (REST),
+  and `mentisdb dream promote|dismiss <dream_id> --agent <id>` (CLI, `--agent`
+  required — the CLI has no other way to know who is reviewing).
+- **Dashboard**: the "Dreams" tab lists every chain's dream passes grouped by
+  pass, with each pass's report (duration, per-operation counts, token usage)
+  and its output thoughts (type/tag/status badges, content preview), a small
+  chart of thoughts-written-per-pass over time, and Promote / Edit-and-promote
+  / Dismiss buttons per output thought.
 
 ### Memory Scopes
 

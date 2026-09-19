@@ -1675,6 +1675,8 @@ fn rest_router_with_service(service: Arc<MentisDbService>) -> Router {
         .route("/v1/webhooks/{id}", delete(rest_delete_webhook_handler))
         .route("/v1/extract-memories", post(rest_extract_memories_handler))
         .route("/v1/dream", post(rest_dream_handler))
+        .route("/v1/dreams/promote", post(rest_promote_dream_handler))
+        .route("/v1/dreams/dismiss", post(rest_dismiss_dream_handler))
         .with_state(service.clone())
         .layer(middleware::from_fn_with_state(
             service,
@@ -1955,6 +1957,8 @@ pub fn rest_router(config: MentisDbServiceConfig) -> Router {
         .route("/v1/webhooks/{id}", delete(rest_delete_webhook_handler))
         .route("/v1/extract-memories", post(rest_extract_memories_handler))
         .route("/v1/dream", post(rest_dream_handler))
+        .route("/v1/dreams/promote", post(rest_promote_dream_handler))
+        .route("/v1/dreams/dismiss", post(rest_dismiss_dream_handler))
         .with_state(service.clone())
         .layer(middleware::from_fn_with_state(
             service,
@@ -2410,6 +2414,8 @@ fn default_chain_mcp_tool(tool_name: &str) -> bool {
             | "mentisdb_head"
             | "mentisdb_extract_memories"
             | "mentisdb_dream"
+            | "mentisdb_promote_dream"
+            | "mentisdb_dismiss_dream"
     )
 }
 
@@ -2632,6 +2638,12 @@ impl ToolProtocol for MentisDbMcpProtocol {
             }
             "mentisdb_dream" => {
                 parse_and_call(parameters, |request| self.service.dream(request)).await
+            }
+            "mentisdb_promote_dream" => {
+                parse_and_call(parameters, |request| self.service.promote_dream(request)).await
+            }
+            "mentisdb_dismiss_dream" => {
+                parse_and_call(parameters, |request| self.service.dismiss_dream(request)).await
             }
             _ => {
                 return Err(Box::new(ToolError::NotFound(tool_name.to_string())));
@@ -4693,6 +4705,62 @@ impl MentisDbService {
         Ok(DreamResponse { report, ran: true })
     }
 
+    pub(crate) async fn promote_dream(
+        &self,
+        request: PromoteDreamRequest,
+    ) -> Result<PromoteDismissDreamResponse, Box<dyn Error + Send + Sync>> {
+        let chain_key = self.resolve_chain_key(request.chain_key.as_deref());
+        let chain = self.get_chain(Some(&chain_key), None).await?;
+        let thought = {
+            let mut guard = chain.write().await;
+            let thought = guard
+                .promote_dream(
+                    &request.agent_id,
+                    request.dream_id,
+                    request.edited_content.as_deref(),
+                )?
+                .clone();
+            thought_to_json(&guard, &thought)
+        };
+        self.log_interaction(InteractionLogEntry {
+            access: "write",
+            operation: "promote_dream",
+            chain_key,
+            metadata: InteractionMetadata::default(),
+            result_count: Some(1),
+            note: Some(format!("dream_id={}", request.dream_id)),
+        });
+        Ok(PromoteDismissDreamResponse { thought })
+    }
+
+    pub(crate) async fn dismiss_dream(
+        &self,
+        request: DismissDreamRequest,
+    ) -> Result<PromoteDismissDreamResponse, Box<dyn Error + Send + Sync>> {
+        let chain_key = self.resolve_chain_key(request.chain_key.as_deref());
+        let chain = self.get_chain(Some(&chain_key), None).await?;
+        let thought = {
+            let mut guard = chain.write().await;
+            let thought = guard
+                .dismiss_dream(
+                    &request.agent_id,
+                    request.dream_id,
+                    request.reason.as_deref(),
+                )?
+                .clone();
+            thought_to_json(&guard, &thought)
+        };
+        self.log_interaction(InteractionLogEntry {
+            access: "write",
+            operation: "dismiss_dream",
+            chain_key,
+            metadata: InteractionMetadata::default(),
+            result_count: Some(1),
+            note: Some(format!("dream_id={}", request.dream_id)),
+        });
+        Ok(PromoteDismissDreamResponse { thought })
+    }
+
     async fn head(
         &self,
         request: ChainHeadRequest,
@@ -5724,6 +5792,37 @@ pub(crate) struct DreamResponse {
     /// runs when invoked (it ignores idleness). Reserved for a future
     /// distinction if the manual trigger ever gains a reason to refuse.
     pub(crate) ran: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PromoteDreamRequest {
+    /// Optional chain key. Defaults to the server default chain.
+    pub(crate) chain_key: Option<String>,
+    /// Id of the [`crate::ThoughtRole::Dream`] thought to promote.
+    pub(crate) dream_id: Uuid,
+    /// Id of the agent or human reviewer performing the promotion.
+    pub(crate) agent_id: String,
+    /// Optional replacement content. Defaults to the dream's own content.
+    pub(crate) edited_content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DismissDreamRequest {
+    /// Optional chain key. Defaults to the server default chain.
+    pub(crate) chain_key: Option<String>,
+    /// Id of the [`crate::ThoughtRole::Dream`] thought to dismiss.
+    pub(crate) dream_id: Uuid,
+    /// Id of the agent or human reviewer performing the dismissal.
+    pub(crate) agent_id: String,
+    /// Optional reason. Defaults to a placeholder when omitted.
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PromoteDismissDreamResponse {
+    /// The newly appended thought (`Memory`-role for promote, `Audit`-role
+    /// for dismiss).
+    pub(crate) thought: Value,
 }
 
 /// Tracks chain keys with a dream pass currently running so a manual
@@ -7228,6 +7327,20 @@ async fn rest_dream_handler(
     service_call(service.dream(request).await)
 }
 
+async fn rest_promote_dream_handler(
+    State(service): State<Arc<MentisDbService>>,
+    Json(request): Json<PromoteDreamRequest>,
+) -> Result<Json<PromoteDismissDreamResponse>, (StatusCode, Json<Value>)> {
+    service_call(service.promote_dream(request).await)
+}
+
+async fn rest_dismiss_dream_handler(
+    State(service): State<Arc<MentisDbService>>,
+    Json(request): Json<DismissDreamRequest>,
+) -> Result<Json<PromoteDismissDreamResponse>, (StatusCode, Json<Value>)> {
+    service_call(service.dismiss_dream(request).await)
+}
+
 async fn rest_flush_handler(
     State(service): State<Arc<MentisDbService>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -7862,6 +7975,28 @@ fn mcp_tool_metadata() -> Vec<ToolMetadata> {
         .with_parameter(ToolParameter::new("chain_key", ToolParameterType::String).with_description("Optional durable chain key. Defaults to the server default."))
         .with_parameter(ToolParameter::new("dry_run", ToolParameterType::Boolean).with_description("When true, compute and return the pass report without appending anything. Default false."))
         .with_parameter(ToolParameter::new("phases", ToolParameterType::Array).with_description("Optional subset of dream phases to run (consolidate, decay, recombine). Validated but has no effect until Phase 1/2 land.").with_items(ToolParameterType::String)),
+        ToolMetadata::new(
+            "mentisdb_promote_dream",
+            "Promote a Dream-role thought into a normal, trusted memory. Appends a new \
+             thought carrying the dream's own semantic type but role Memory, linked back \
+             to the dream via a DerivedFrom relation. The dream thought itself is left in \
+             place for audit — this is a plain append, never a rewrite.",
+        )
+        .with_parameter(ToolParameter::new("chain_key", ToolParameterType::String).with_description("Optional durable chain key. Defaults to the server default."))
+        .with_parameter(ToolParameter::new("dream_id", ToolParameterType::String).with_description("Id of the Dream-role thought to promote.").required())
+        .with_parameter(ToolParameter::new("agent_id", ToolParameterType::String).with_description("Id of the agent or human reviewer performing the promotion.").required())
+        .with_parameter(ToolParameter::new("edited_content", ToolParameterType::String).with_description("Optional replacement content. Defaults to the dream's own content.")),
+        ToolMetadata::new(
+            "mentisdb_dismiss_dream",
+            "Dismiss a Dream-role thought: an awake agent or human reviewer has decided \
+             not to trust it. Appends an Audit-role Correction thought carrying the \
+             dismissal reason, linked to the dream via an Invalidates relation. The dream \
+             is marked invalidated immediately; nothing is deleted or rewritten.",
+        )
+        .with_parameter(ToolParameter::new("chain_key", ToolParameterType::String).with_description("Optional durable chain key. Defaults to the server default."))
+        .with_parameter(ToolParameter::new("dream_id", ToolParameterType::String).with_description("Id of the Dream-role thought to dismiss.").required())
+        .with_parameter(ToolParameter::new("agent_id", ToolParameterType::String).with_description("Id of the agent or human reviewer performing the dismissal.").required())
+        .with_parameter(ToolParameter::new("reason", ToolParameterType::String).with_description("Optional reason. Defaults to a placeholder when omitted.")),
     ]
 }
 

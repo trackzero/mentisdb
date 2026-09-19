@@ -85,6 +85,36 @@ pub struct DreamCommand {
     pub url: String,
 }
 
+/// Parsed `dream promote` subcommand arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DreamPromoteCommand {
+    /// Id of the Dream-role thought to promote.
+    pub dream_id: String,
+    /// Id of the agent or human reviewer performing the promotion.
+    pub agent_id: String,
+    /// Optional chain key.
+    pub chain: Option<String>,
+    /// Optional replacement content. Defaults to the dream's own content.
+    pub edited_content: Option<String>,
+    /// Daemon REST URL.
+    pub url: String,
+}
+
+/// Parsed `dream dismiss` subcommand arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DreamDismissCommand {
+    /// Id of the Dream-role thought to dismiss.
+    pub dream_id: String,
+    /// Id of the agent or human reviewer performing the dismissal.
+    pub agent_id: String,
+    /// Optional chain key.
+    pub chain: Option<String>,
+    /// Optional reason. Defaults to a placeholder when omitted.
+    pub reason: Option<String>,
+    /// Daemon REST URL.
+    pub url: String,
+}
+
 /// Parsed `backup` subcommand arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupCommand {
@@ -220,6 +250,10 @@ pub enum CliCommand {
     DreamHelp,
     /// Trigger a manual dream pass on a running daemon.
     Dream(DreamCommand),
+    /// Promote a Dream-role thought into a normal, trusted memory.
+    DreamPromote(DreamPromoteCommand),
+    /// Dismiss a Dream-role thought: a reviewer decided not to trust it.
+    DreamDismiss(DreamDismissCommand),
     /// List agents on a running daemon.
     Agents(AgentsCommand),
     /// Create a backup archive.
@@ -673,6 +707,8 @@ mentisdb dream — Manually trigger an offline dream pass on a running MentisDB 
 
 Usage:
   mentisdb dream [--chain <key>] [--dry-run] [--phase <phase,...>] [--url <url>]
+  mentisdb dream promote <dream_id> --agent <id> [--chain <key>] [--edited-content <text>] [--url <url>]
+  mentisdb dream dismiss <dream_id> --agent <id> [--chain <key>] [--reason <text>] [--url <url>]
 
 Options:
   --chain <key>    Chain key (uses daemon default if omitted)
@@ -683,13 +719,19 @@ Options:
 
 Notes:
   This is the manual trigger; it ignores idleness and always runs when invoked.
-  Phase 0 performs no consolidation, decay, or recombination yet — --phase is
-  validated but has no effect until Phase 1/2 land.
+
+Promote/dismiss:
+  Promote a Dream-role thought into a normal, trusted memory, or dismiss one a
+  reviewer decided not to trust. Both are plain appends (DerivedFrom / Invalidates
+  relations) — the dream thought itself is left in place for audit. --agent is
+  required: the CLI has no other way to know who is reviewing.
 
 Examples:
   mentisdb dream --dry-run
   mentisdb dream --chain my-project
   mentisdb dream --phase consolidate,decay
+  mentisdb dream promote <dream_id> --agent alice
+  mentisdb dream dismiss <dream_id> --agent alice --reason \"not useful\"
 "
 }
 
@@ -1163,6 +1205,13 @@ fn parse_search(args: Vec<String>) -> Result<CliCommand, String> {
 }
 
 fn parse_dream(args: Vec<String>) -> Result<CliCommand, String> {
+    if let Some(first) = args.get(1) {
+        match first.as_str() {
+            "promote" => return parse_dream_promote(args),
+            "dismiss" => return parse_dream_dismiss(args),
+            _ => {}
+        }
+    }
     let mut chain = None;
     let mut dry_run = false;
     let mut phase = None;
@@ -1214,6 +1263,120 @@ fn parse_dream(args: Vec<String>) -> Result<CliCommand, String> {
         chain,
         dry_run,
         phase,
+        url,
+    }))
+}
+
+fn parse_dream_promote(args: Vec<String>) -> Result<CliCommand, String> {
+    let dream_id = args
+        .get(2)
+        .ok_or_else(|| "dream promote requires a <dream_id> argument".to_string())?
+        .clone();
+    let mut agent_id = None;
+    let mut chain = None;
+    let mut edited_content = None;
+    let mut url = default_rest_url();
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--agent" => {
+                agent_id = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--agent requires a value".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--chain" => {
+                chain = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--chain requires a value".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--edited-content" => {
+                edited_content = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--edited-content requires a value".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--url" => {
+                url = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--url requires a value".to_string())?
+                    .clone();
+                index += 2;
+            }
+            "-h" | "--help" => return Ok(CliCommand::DreamHelp),
+            other => return Err(format!("Unexpected argument '{other}' for dream promote")),
+        }
+    }
+    let agent_id = agent_id.ok_or_else(|| "--agent is required for dream promote".to_string())?;
+    Ok(CliCommand::DreamPromote(DreamPromoteCommand {
+        dream_id,
+        agent_id,
+        chain,
+        edited_content,
+        url,
+    }))
+}
+
+fn parse_dream_dismiss(args: Vec<String>) -> Result<CliCommand, String> {
+    let dream_id = args
+        .get(2)
+        .ok_or_else(|| "dream dismiss requires a <dream_id> argument".to_string())?
+        .clone();
+    let mut agent_id = None;
+    let mut chain = None;
+    let mut reason = None;
+    let mut url = default_rest_url();
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--agent" => {
+                agent_id = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--agent requires a value".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--chain" => {
+                chain = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--chain requires a value".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--reason" => {
+                reason = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--reason requires a value".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--url" => {
+                url = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--url requires a value".to_string())?
+                    .clone();
+                index += 2;
+            }
+            "-h" | "--help" => return Ok(CliCommand::DreamHelp),
+            other => return Err(format!("Unexpected argument '{other}' for dream dismiss")),
+        }
+    }
+    let agent_id = agent_id.ok_or_else(|| "--agent is required for dream dismiss".to_string())?;
+    Ok(CliCommand::DreamDismiss(DreamDismissCommand {
+        dream_id,
+        agent_id,
+        chain,
+        reason,
         url,
     }))
 }
