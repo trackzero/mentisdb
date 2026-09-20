@@ -1876,7 +1876,17 @@ async fn dashboard_html_includes_chain_search_scaffolding() {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let html = String::from_utf8(body.to_vec()).unwrap();
+    // DASHBOARD_HTML is embedded via include_str!, which preserves the
+    // source file's raw bytes verbatim (including CRLF on a Windows
+    // checkout with core.autocrlf=true). The multi-line raw string literals
+    // below are embedded directly in this .rs file, and rustc's lexer
+    // normalizes CRLF to LF inside literals before this test ever runs, so
+    // on a CRLF checkout `html` and the literals would disagree on line
+    // endings alone. Normalize `html` the same way so the comparison is
+    // about content, not the checkout's line-ending mode.
+    let html = String::from_utf8(body.to_vec())
+        .unwrap()
+        .replace("\r\n", "\n");
     assert!(html.contains("ex-search-text"));
     assert!(html.contains("Vector Sidecars"));
     assert!(html.contains("loadVectorPanel(chainKey)"));
