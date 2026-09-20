@@ -120,6 +120,95 @@ async fn copy_to_chain_preserves_agent_description_for_detail_api() {
 }
 
 #[tokio::test]
+async fn settings_list_exposes_dream_config_env_vars() {
+    let dir = unique_chain_dir();
+    let router = dashboard_router_for_dir(&dir);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let settings: Value = serde_json::from_slice(&body).unwrap();
+    let list = settings.as_array().expect("settings response is an array");
+
+    let expected = [
+        ("MENTISDB_DREAM_ENABLED", "boolean", "false"),
+        ("MENTISDB_DREAM_LLM", "boolean", "false"),
+        ("MENTISDB_DREAM_IDLE_SECS", "number", "900"),
+        ("MENTISDB_DREAM_INTERVAL_SECS", "number", "3600"),
+        ("MENTISDB_DREAM_MAX_SCAN", "number", "500"),
+        ("MENTISDB_DREAM_MAX_WRITES", "number", "20"),
+        ("MENTISDB_DREAM_RECOMBINATION_BUDGET", "number", "3"),
+        ("MENTISDB_DREAM_WEIGHT", "number", "0.5"),
+        ("MENTISDB_DREAM_CHAINS", "string", ""),
+    ];
+    for (name, kind, default_value) in expected {
+        let entry = list
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap_or_else(|| panic!("settings list is missing {name}"));
+        assert_eq!(entry["kind"], kind, "{name} has the wrong kind");
+        assert_eq!(
+            entry["default_value"], default_value,
+            "{name} has the wrong default_value"
+        );
+        // Every dream setting requires a restart today, since DreamConfig is
+        // parsed once at service startup and threaded per-chain, not
+        // re-read live.
+        assert_eq!(entry["hot_reload"], false, "{name} should not be hot-reload");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn updating_a_dream_setting_persists_to_env_file_and_requires_restart() {
+    let dir = unique_chain_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let router = dashboard_router_for_dir(&dir);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/api/settings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "settings": {"MENTISDB_DREAM_ENABLED": "true"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["success"], true);
+    assert_eq!(json["restart_required"], true);
+
+    let env_contents = std::fs::read_to_string(dir.join(".env")).unwrap();
+    assert!(env_contents.contains("MENTISDB_DREAM_ENABLED=true"));
+
+    std::env::remove_var("MENTISDB_DREAM_ENABLED");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn agent_detail_form_hydrates_values_after_dom_insertion() {
     let dir = unique_chain_dir();
     let router = dashboard_router_for_dir(&dir);

@@ -147,14 +147,23 @@ impl DreamConfig {
     /// [`DreamConfig::default`] for anything unset or unparseable.
     ///
     /// Reads `MENTISDB_DREAM_ENABLED`, `MENTISDB_DREAM_IDLE_SECS`,
-    /// `MENTISDB_DREAM_INTERVAL_SECS`, `MENTISDB_DREAM_MAX_WRITES`, and
-    /// `MENTISDB_DREAM_WEIGHT`.
+    /// `MENTISDB_DREAM_INTERVAL_SECS`, `MENTISDB_DREAM_MAX_SCAN`,
+    /// `MENTISDB_DREAM_MAX_WRITES`, `MENTISDB_DREAM_WEIGHT`,
+    /// `MENTISDB_DREAM_RECOMBINATION_BUDGET`, and `MENTISDB_DREAM_CHAINS`
+    /// (a comma-separated chain-key allowlist for the idle scheduler; empty
+    /// or unset means the default chain only, trimmed of surrounding
+    /// whitespace per entry).
     ///
     /// `MENTISDB_DREAM_LLM` is a boolean gate, not an LLM config itself: when
     /// it parses as truthy, [`crate::LlmExtractionConfig::from_env`] is
     /// attempted and stored on success; otherwise (including a failed
     /// attempt) `llm` stays `None`, keeping the no-LLM core path the
     /// default.
+    ///
+    /// `seed` and `half_life_overrides_days` have no env var form: `seed` is
+    /// unused by any phase so far (reserved for future sampling), and a
+    /// per-type half-life override map has no natural single-variable
+    /// encoding — set both via the library API directly if needed.
     pub fn from_env() -> Self {
         let defaults = Self::default();
         Self {
@@ -163,17 +172,27 @@ impl DreamConfig {
                 .unwrap_or(defaults.idle_after_secs),
             min_interval_secs: env_parsed("MENTISDB_DREAM_INTERVAL_SECS")
                 .unwrap_or(defaults.min_interval_secs),
-            max_scan: defaults.max_scan,
+            max_scan: env_parsed("MENTISDB_DREAM_MAX_SCAN").unwrap_or(defaults.max_scan),
             max_writes_per_pass: env_parsed("MENTISDB_DREAM_MAX_WRITES")
                 .unwrap_or(defaults.max_writes_per_pass),
-            chains: defaults.chains,
+            chains: std::env::var("MENTISDB_DREAM_CHAINS")
+                .ok()
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or(defaults.chains),
             dream_weight: env_parsed("MENTISDB_DREAM_WEIGHT").unwrap_or(defaults.dream_weight),
             llm: if env_bool("MENTISDB_DREAM_LLM").unwrap_or(false) {
                 crate::LlmExtractionConfig::from_env().ok()
             } else {
                 None
             },
-            recombination_budget: defaults.recombination_budget,
+            recombination_budget: env_parsed("MENTISDB_DREAM_RECOMBINATION_BUDGET")
+                .unwrap_or(defaults.recombination_budget),
             seed: defaults.seed,
             half_life_overrides_days: defaults.half_life_overrides_days,
         }
@@ -576,6 +595,42 @@ mod tests {
         assert!(config.llm.is_none());
         assert_eq!(config.recombination_budget, 3);
         assert_eq!(config.seed, None);
+    }
+
+    #[test]
+    fn from_env_reads_max_scan_recombination_budget_and_chains() {
+        // Unique var names for this test only, to avoid cross-test interference
+        // under parallel test execution (no other test in this crate touches
+        // these three).
+        std::env::set_var("MENTISDB_DREAM_MAX_SCAN", "250");
+        std::env::set_var("MENTISDB_DREAM_RECOMBINATION_BUDGET", "7");
+        std::env::set_var("MENTISDB_DREAM_CHAINS", "alpha, beta ,gamma");
+
+        let config = DreamConfig::from_env();
+
+        std::env::remove_var("MENTISDB_DREAM_MAX_SCAN");
+        std::env::remove_var("MENTISDB_DREAM_RECOMBINATION_BUDGET");
+        std::env::remove_var("MENTISDB_DREAM_CHAINS");
+
+        assert_eq!(config.max_scan, 250);
+        assert_eq!(config.recombination_budget, 7);
+        assert_eq!(config.chains, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn from_env_falls_back_to_defaults_when_new_vars_are_unset() {
+        std::env::remove_var("MENTISDB_DREAM_MAX_SCAN");
+        std::env::remove_var("MENTISDB_DREAM_RECOMBINATION_BUDGET");
+        std::env::remove_var("MENTISDB_DREAM_CHAINS");
+
+        let config = DreamConfig::from_env();
+
+        assert_eq!(config.max_scan, DreamConfig::default().max_scan);
+        assert_eq!(
+            config.recombination_budget,
+            DreamConfig::default().recombination_budget
+        );
+        assert!(config.chains.is_empty());
     }
 
     #[test]
