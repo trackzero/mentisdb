@@ -2,8 +2,11 @@
 //!
 //! This module transforms free-form agent text into structured [`ThoughtInput`]
 //! records using an OpenAI-compatible chat completion API via `openai-rust2`,
-//! which provides connection pooling, automatic retries (up to 3 attempts on
-//! 429 / 5xx responses), and configurable timeouts.
+//! which provides connection pooling. `openai-rust2` itself has no retry or
+//! timeout logic (verified against its source — earlier docs here claimed
+//! otherwise); [`chat_completion`] applies its own request timeout (see
+//! `MENTISDB_LLM_TIMEOUT_SECS` below). There is no automatic retry on
+//! 429/5xx responses.
 //!
 //! # Security
 //!
@@ -18,8 +21,39 @@ use crate::{
 use openai_rust2::chat::{ChatArguments, Message};
 use openai_rust2::Client;
 use serde::Deserialize;
+use std::time::Duration;
 
 const DEFAULT_LLM_MODEL: &str = "gpt-4o";
+
+/// Default request timeout for [`chat_completion`], used when
+/// `MENTISDB_LLM_TIMEOUT_SECS` is unset or unparseable.
+///
+/// `reqwest` has no request timeout by default, so without this a hung
+/// endpoint would block the caller forever — for the dreaming scheduler
+/// specifically, that means blocking every configured chain's idle pass
+/// indefinitely (`dream::scheduler::run_tick` awaits each chain's pass in
+/// turn on one task). 15 minutes is deliberately generous rather than tuned
+/// for interactive latency: local models (e.g. Ollama) can take minutes to
+/// load before the first response, and the dreaming pipeline this mostly
+/// guards is explicitly not latency-sensitive. This is a safety net against
+/// a truly hung connection, not a responsiveness tuning knob.
+const DEFAULT_LLM_TIMEOUT_SECS: u64 = 900;
+
+/// Read the configured [`chat_completion`] request timeout from
+/// `MENTISDB_LLM_TIMEOUT_SECS`, falling back to
+/// [`DEFAULT_LLM_TIMEOUT_SECS`] when unset or unparseable as a positive
+/// integer. Read fresh on every call, so a change takes effect on the next
+/// LLM call with no restart needed.
+fn llm_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("MENTISDB_LLM_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&secs| secs > 0)
+            .unwrap_or(DEFAULT_LLM_TIMEOUT_SECS),
+    )
+}
+
 const EXTRACTION_TEMPERATURE: f32 = 0.1;
 
 const EXTRACTION_PROMPT: &str = r#"You are a memory analyst. Your task is to extract structured memory records from the provided text.
@@ -164,14 +198,20 @@ pub(crate) async fn chat_completion(
     );
     args.temperature = Some(temperature);
 
-    let response =
-        client
-            .create_chat(args, None)
-            .await
-            .map_err(|e| LlmExtractionError::ApiError {
-                status: 0,
-                message: e.to_string(),
-            })?;
+    let timeout = llm_timeout();
+    let response = tokio::time::timeout(timeout, client.create_chat(args, None))
+        .await
+        .map_err(|_elapsed| LlmExtractionError::ApiError {
+            status: 0,
+            message: format!(
+                "LLM request timed out after {}s (MENTISDB_LLM_TIMEOUT_SECS)",
+                timeout.as_secs()
+            ),
+        })?
+        .map_err(|e| LlmExtractionError::ApiError {
+            status: 0,
+            message: e.to_string(),
+        })?;
 
     let raw_content = response
         .choices
@@ -252,6 +292,9 @@ fn parse_thought_type(name: &str) -> Result<ThoughtType, String> {
     name.parse::<ThoughtType>()
         .map_err(|error| error.to_string())
 }
+
+#[cfg(test)]
+static LLM_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -346,5 +389,36 @@ mod tests {
         let result = validate_and_transform_thoughts(raw_thoughts).unwrap();
         assert_eq!(result[0].importance, 1.0);
         assert_eq!(result[1].importance, 0.0);
+    }
+
+    // Serialized: these tests share the process-global MENTISDB_LLM_TIMEOUT_SECS
+    // env var, which races under cargo's default parallel test execution.
+    #[test]
+    fn llm_timeout_falls_back_to_default_when_unset() {
+        let _guard = LLM_TIMEOUT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("MENTISDB_LLM_TIMEOUT_SECS");
+        assert_eq!(llm_timeout(), Duration::from_secs(DEFAULT_LLM_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn llm_timeout_reads_a_valid_override() {
+        let _guard = LLM_TIMEOUT_ENV_LOCK.lock().unwrap();
+        std::env::set_var("MENTISDB_LLM_TIMEOUT_SECS", "45");
+        assert_eq!(llm_timeout(), Duration::from_secs(45));
+        std::env::remove_var("MENTISDB_LLM_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn llm_timeout_falls_back_to_default_for_zero_or_unparseable() {
+        let _guard = LLM_TIMEOUT_ENV_LOCK.lock().unwrap();
+        for bad in ["0", "not-a-number", ""] {
+            std::env::set_var("MENTISDB_LLM_TIMEOUT_SECS", bad);
+            assert_eq!(
+                llm_timeout(),
+                Duration::from_secs(DEFAULT_LLM_TIMEOUT_SECS),
+                "input {bad:?} should fall back to the default"
+            );
+        }
+        std::env::remove_var("MENTISDB_LLM_TIMEOUT_SECS");
     }
 }

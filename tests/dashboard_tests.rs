@@ -232,6 +232,7 @@ async fn settings_list_exposes_llm_base_url_and_model() {
     let expected = [
         ("LLM_BASE_URL", "string", "https://api.openai.com/v1"),
         ("LLM_MODEL", "string", "gpt-4"),
+        ("MENTISDB_LLM_TIMEOUT_SECS", "number", "900"),
     ];
     for (name, kind, default_value) in expected {
         let entry = list
@@ -270,7 +271,8 @@ async fn updating_llm_base_url_persists_to_env_file_without_requiring_restart() 
                     serde_json::json!({
                         "settings": {
                             "LLM_BASE_URL": "http://192.168.1.30:11434/v1",
-                            "LLM_MODEL": "llama3.1"
+                            "LLM_MODEL": "llama3.1",
+                            "MENTISDB_LLM_TIMEOUT_SECS": "120"
                         }
                     })
                     .to_string(),
@@ -290,9 +292,11 @@ async fn updating_llm_base_url_persists_to_env_file_without_requiring_restart() 
     let env_contents = std::fs::read_to_string(dir.join(".env")).unwrap();
     assert!(env_contents.contains("LLM_BASE_URL=http://192.168.1.30:11434/v1"));
     assert!(env_contents.contains("LLM_MODEL=llama3.1"));
+    assert!(env_contents.contains("MENTISDB_LLM_TIMEOUT_SECS=120"));
 
     std::env::remove_var("LLM_BASE_URL");
     std::env::remove_var("LLM_MODEL");
+    std::env::remove_var("MENTISDB_LLM_TIMEOUT_SECS");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

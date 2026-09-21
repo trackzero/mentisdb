@@ -2028,6 +2028,14 @@ live from the dashboard Settings page — point `LLM_BASE_URL` at a local
 Ollama instance's OpenAI-compatible endpoint (e.g. `http://192.168.1.30:11434/v1`)
 to use Ollama instead of OpenAI.
 
+`reqwest` has no request timeout by default, so a wedged endpoint would
+otherwise hang the calling request forever. `MENTISDB_LLM_TIMEOUT_SECS`
+(default `900`, i.e. 15 minutes; also editable from the dashboard) bounds
+every `LLM_BASE_URL` call. The default is deliberately generous rather than
+tuned for interactive latency — local models (e.g. Ollama) can take minutes
+to load before the first response, and it exists as a safety net against a
+truly hung connection, not a responsiveness knob.
+
 ```rust,ignore
 use mentisdb::{LlmExtractionConfig, extract_memories_from_text};
 

@@ -1,4 +1,27 @@
 0.10.8.54 SEP/18/2026 (feature/dreaming, Phase 0+1+2+3 — not yet released)
+  - fix(llm): `chat_completion` (shared by `extract_memories` and dreaming's
+    LLM-assisted operations) had no request timeout. `openai-rust2` has no
+    retry or timeout logic of its own (verified against its source -- the
+    module doc here previously claimed otherwise, now corrected), and
+    `reqwest` has no timeout by default, so a wedged endpoint would hang the
+    calling request forever -- for the dreaming scheduler specifically, that
+    means blocking every configured chain's idle pass indefinitely, since
+    `run_tick` awaits each chain's pass on one task. Added
+    `MENTISDB_LLM_TIMEOUT_SECS` (default 900s / 15 minutes, also editable
+    from the dashboard Settings page), wrapping the call in
+    `tokio::time::timeout` rather than a `reqwest::ClientBuilder` timeout,
+    since `openai-rust2` depends on `reqwest 0.12` while mentisdb's own
+    direct dependency is `reqwest 0.13` -- two incompatible majors coexist
+    in the graph, so a client built from mentisdb's own `reqwest` isn't
+    accepted by `openai-rust2`'s `Client::new_with_client*`. The 15-minute
+    default is deliberately generous, not tuned for responsiveness: local
+    models (e.g. Ollama) can take minutes to load before the first
+    response, and the dreaming pipeline this mostly guards is explicitly
+    not latency-sensitive. Required adding `dep:tokio` to the
+    `llm-extraction` feature (previously only pulled in via `server`) since
+    `tokio::time::timeout` needs it -- `reqwest`'s async client already
+    requires tokio transitively regardless, so this makes an existing
+    requirement explicit rather than adding new dependency weight.
   - feat(dashboard): expose `LLM_BASE_URL` and `LLM_MODEL` on the Settings
     page (`OPENAI_API_KEY` stays `.env`-only). Both are `hot_reload: true`:
     `extract_memories` (MCP/REST) re-reads `LlmExtractionConfig::from_env()`

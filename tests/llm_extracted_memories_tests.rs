@@ -193,3 +193,39 @@ fn test_llm_extraction_parse_error_includes_raw_output() {
     assert!(rendered.contains("missing field `thought_type`"));
     assert!(rendered.contains("Raw output:"));
 }
+
+/// `reqwest` has no request timeout by default, so a wedged endpoint (not
+/// just a slow one) would otherwise hang `chat_completion` forever.
+/// MENTISDB_LLM_TIMEOUT_SECS bounds that: point base_url at a listener that
+/// accepts the connection but never writes a response, and confirm the call
+/// errors out promptly instead of hanging.
+#[tokio::test]
+async fn extract_memories_times_out_on_a_hung_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((_stream, _)) = listener.accept().await {
+            // Hold the connection open without ever responding.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
+
+    std::env::set_var("MENTISDB_LLM_TIMEOUT_SECS", "1");
+    let config = LlmExtractionConfig {
+        base_url: format!("http://{addr}/v1"),
+        api_key: "test-key".to_string(),
+        model: "test-model".to_string(),
+    };
+
+    let started = std::time::Instant::now();
+    let result =
+        mentisdb::llm::extract_memories_from_text("some text to extract", &config, None).await;
+    std::env::remove_var("MENTISDB_LLM_TIMEOUT_SECS");
+
+    assert!(result.is_err(), "expected a timeout error, got {:?}", result);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "call should have timed out around 1s, took {:?} instead",
+        started.elapsed()
+    );
+}

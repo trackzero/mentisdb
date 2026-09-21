@@ -3326,6 +3326,14 @@ async fn api_settings(
             kind: "string".to_string(),
             hot_reload: true,
         },
+        DashboardSetting {
+            name: "MENTISDB_LLM_TIMEOUT_SECS".to_string(),
+            value: std::env::var("MENTISDB_LLM_TIMEOUT_SECS").unwrap_or_default(),
+            default_value: "900".to_string(),
+            description: "Request timeout in seconds for LLM_BASE_URL calls (reqwest has no timeout by default, so without this a wedged endpoint would hang forever). Deliberately generous rather than tuned for responsiveness -- local models (e.g. Ollama) can take minutes to load before the first response. Takes effect immediately for extract_memories; the dreaming scheduler caches its LLM config at startup and needs a restart to pick up a change.".to_string(),
+            kind: "number".to_string(),
+            hot_reload: true,
+        },
     ];
     Ok(Json(settings))
 }
@@ -3396,6 +3404,7 @@ const ALLOWED_SETTING_KEYS: &[&str] = &[
     "MENTISDB_DREAM_CHAINS",
     "LLM_BASE_URL",
     "LLM_MODEL",
+    "MENTISDB_LLM_TIMEOUT_SECS",
 ];
 
 /// Validate that a setting name is in the whitelist and the value does not
@@ -3462,7 +3471,8 @@ async fn api_update_settings(
             | "MENTISDB_HNSW_EF_SEARCH"
             | "MENTISDB_HNSW_BACKGROUND_BUILD"
             | "LLM_BASE_URL"
-            | "LLM_MODEL" => {
+            | "LLM_MODEL"
+            | "MENTISDB_LLM_TIMEOUT_SECS" => {
                 // These are read from env on demand
             }
             _ => {

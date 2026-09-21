@@ -17,7 +17,7 @@ default = ["server", "startup-sound", "llm-extraction", "local-embeddings"]
 server = ["dep:axum", "dep:env_logger", "dep:if-addrs", "dep:log", "dep:tokio", "mcp/server", "dep:rcgen", "dep:axum-server", "dep:rustls-pemfile", "dep:x509-parser", "dep:reqwest", "dep:rustls"]
 startup-sound = ["dep:rodio"]
 local-embeddings = ["dep:fastembed", "dep:rustls"]
-llm-extraction = ["dep:openai-rust2", "dep:anyhow"]
+llm-extraction = ["dep:openai-rust2", "dep:anyhow", "dep:tokio"]
 
 [dependencies]
 async-trait = "0.1.89"
