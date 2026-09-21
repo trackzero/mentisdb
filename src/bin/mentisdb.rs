@@ -2369,6 +2369,7 @@ where
             | "wizard"
             | "add"
             | "search"
+            | "dream"
             | "agents"
             | "backup"
             | "restore"

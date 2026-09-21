@@ -208,6 +208,25 @@ fn parse_daemon_args_accepts_native_setup_and_wizard_subcommands() {
 }
 
 #[test]
+fn parse_daemon_args_accepts_dream_subcommand() {
+    // Regression test: `dream` was implemented end-to-end in
+    // src/cli/args.rs (parse_dream, including `dream promote`/`dream
+    // dismiss`) and documented in --help, but the top-level dispatch match
+    // never listed "dream" alongside the other CLI subcommands, so
+    // `mentisdb dream ...` fell through to the daemon's "Unexpected
+    // arguments" error instead of reaching parse_dream at all.
+    assert_eq!(
+        mentisdb_impl::parse_daemon_args([OsString::from("dream"), OsString::from("--dry-run")])
+            .unwrap(),
+        mentisdb_impl::DaemonArgMode::CliSubcommand(vec![
+            OsString::from("mentisdb"),
+            OsString::from("dream"),
+            OsString::from("--dry-run"),
+        ])
+    );
+}
+
+#[test]
 fn parse_daemon_args_accepts_update_subcommands() {
     assert_eq!(
         mentisdb_impl::parse_daemon_args([OsString::from("update")]).unwrap(),
