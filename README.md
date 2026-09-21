@@ -2116,7 +2116,35 @@ suggest-don't-act, off by default).
   Ignores idleness and always runs when invoked.
 - Idle scheduler: set `DreamConfig.enabled = true` (or `MENTISDB_DREAM_ENABLED=true`)
   to let the daemon trigger passes automatically on chains that have been
-  idle for `idle_after_secs` (default 900s).
+  idle for `idle_after_secs` (default 900s). Every `DreamConfig` field has an
+  env var (all read once at startup — restart to apply a change, or edit
+  them from the dashboard Settings page, which persists to `.env` and flags
+  `restart_required`):
+  - `MENTISDB_DREAM_ENABLED` (default `false`) — run the idle scheduler at
+    all. Manual triggers ignore this and always run when invoked.
+  - `MENTISDB_DREAM_LLM` (default `false`) — opt into the LLM-assisted
+    operations below, via `LlmExtractionConfig::from_env`
+    (`OPENAI_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL`). Separate from
+    `MENTISDB_DREAM_ENABLED` on purpose, since the scheduler runs
+    unattended.
+  - `MENTISDB_DREAM_IDLE_SECS` (default `900`) — seconds of inactivity
+    before a chain is eligible for an automatic pass.
+  - `MENTISDB_DREAM_INTERVAL_SECS` (default `3600`) — minimum seconds
+    between automatic passes on the same chain.
+  - `MENTISDB_DREAM_MAX_SCAN` (default `500`) — thoughts scanned by a pass
+    with no prior watermark to resume from (a chain's first pass).
+  - `MENTISDB_DREAM_MAX_WRITES` (default `20`) — thoughts a single pass may
+    append, shared across consolidation, dedup, recombination, and
+    contradiction-check.
+  - `MENTISDB_DREAM_RECOMBINATION_BUDGET` (default `3`) — LLM calls per pass
+    across recombination and contradiction-check combined.
+  - `MENTISDB_DREAM_WEIGHT` (default `0.5`) — score multiplier for
+    `Dream`-role thoughts in ranked search when included via
+    `include_dreams`.
+  - `MENTISDB_DREAM_CHAINS` (default empty) — comma-separated chain-key
+    allowlist for the idle scheduler. **Empty means the scheduler only ever
+    considers the default chain** (`MENTISDB_DEFAULT_CHAIN_KEY`) — set this
+    to cover any other chain automatically.
 - Every dream-written thought carries provenance via `ThoughtRole::Dream`,
   the `mentis-dreamer` agent id, and `dream:*` tags. `include_dreams` (on
   `ThoughtQuery` / `RankedSearchQuery` / `recent_context`) opts into seeing

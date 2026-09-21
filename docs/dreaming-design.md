@@ -95,9 +95,14 @@ no side file. If no report exists, the pass starts from
   `recombination_budget` (default 3), and `seed: Option<u64>` for
   deterministic tests.
 - Environment variables: `MENTISDB_DREAM_ENABLED`, `MENTISDB_DREAM_IDLE_SECS`,
-  `MENTISDB_DREAM_INTERVAL_SECS`, `MENTISDB_DREAM_MAX_WRITES`,
-  `MENTISDB_DREAM_WEIGHT`, `MENTISDB_DREAM_LLM` (reuses the existing LLM env
-  configuration).
+  `MENTISDB_DREAM_INTERVAL_SECS`, `MENTISDB_DREAM_MAX_SCAN`,
+  `MENTISDB_DREAM_MAX_WRITES`, `MENTISDB_DREAM_WEIGHT`,
+  `MENTISDB_DREAM_RECOMBINATION_BUDGET`, `MENTISDB_DREAM_CHAINS`
+  (comma-separated allowlist; empty means the default chain only),
+  `MENTISDB_DREAM_LLM` (reuses the existing LLM env configuration). All are
+  also exposed on the dashboard Settings page (`hot_reload: false` — read
+  once at startup, so a change there persists to `.env` and requires a
+  restart).
 - A chain is **idle** when there has been no append by any agent other than
   `mentis-dreamer` for `idle_after_secs`, and the last pass was at least
   `min_interval_secs` ago.

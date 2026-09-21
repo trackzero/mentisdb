@@ -1,4 +1,27 @@
 0.10.8.54 SEP/18/2026 (feature/dreaming, Phase 0+1+2+3 — not yet released)
+  - fix(cli): `mentisdb dream [--chain <key>] [--dry-run] [--phase <phase,...>]`
+    and `mentisdb dream promote|dismiss <dream_id>` were fully implemented
+    (`src/cli/args.rs::parse_dream`) and documented, but the top-level
+    dispatch match in `src/bin/mentisdb.rs::parse_daemon_args` never listed
+    `"dream"` alongside the other CLI subcommands, so every invocation fell
+    through to the daemon's "Unexpected arguments" error instead of ever
+    reaching `parse_dream`. Added `"dream"` to that match arm.
+  - fix(dreaming): `DreamConfig::from_env` silently ignored
+    `MENTISDB_DREAM_MAX_SCAN`, `MENTISDB_DREAM_CHAINS`, and
+    `MENTISDB_DREAM_RECOMBINATION_BUDGET` — all three were hardcoded to
+    their defaults instead of being read from the environment. Wired them
+    up, and exposed all nine `MENTISDB_DREAM_*` settings (including the
+    already-wired ones) through the dashboard Settings API/page like other
+    `MENTISDB_*` config, each marked `hot_reload: false` since `DreamConfig`
+    is parsed once at startup and threaded per-chain.
+  - chore(tests): `dashboard_html_includes_chain_search_scaffolding`
+    compared the live response body against multi-line raw string literals
+    embedded in the test file. `DASHBOARD_HTML` is embedded via
+    `include_str!`, which preserves the source file's raw bytes verbatim
+    (CRLF on a checkout with `core.autocrlf=true`), but rustc's lexer
+    normalizes CRLF to LF inside string literals before compilation — so on
+    a CRLF checkout the two sides could never match even with identical
+    content. Normalize the fetched HTML's line endings before comparing.
   - feat(dreaming): Phase 3 — `promote_dream`/`dismiss_dream` helpers across
     all four surfaces, plus the Dreams dashboard tab. Both are plain appends
     (no new storage semantics): `promote_dream` appends a `Memory`-role
