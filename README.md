@@ -2023,6 +2023,11 @@ export LLM_BASE_URL="https://api.openai.com/v1"  # defaults to OpenAI
 export LLM_MODEL="gpt-4o"                # defaults to gpt-4o
 ```
 
+`LLM_BASE_URL` and `LLM_MODEL` (but not `OPENAI_API_KEY`) are also editable
+live from the dashboard Settings page — point `LLM_BASE_URL` at a local
+Ollama instance's OpenAI-compatible endpoint (e.g. `http://192.168.1.30:11434/v1`)
+to use Ollama instead of OpenAI.
+
 ```rust,ignore
 use mentisdb::{LlmExtractionConfig, extract_memories_from_text};
 

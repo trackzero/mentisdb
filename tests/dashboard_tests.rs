@@ -209,6 +209,94 @@ async fn updating_a_dream_setting_persists_to_env_file_and_requires_restart() {
 }
 
 #[tokio::test]
+async fn settings_list_exposes_llm_base_url_and_model() {
+    let dir = unique_chain_dir();
+    let router = dashboard_router_for_dir(&dir);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let settings: Value = serde_json::from_slice(&body).unwrap();
+    let list = settings.as_array().expect("settings response is an array");
+
+    let expected = [
+        ("LLM_BASE_URL", "string", "https://api.openai.com/v1"),
+        ("LLM_MODEL", "string", "gpt-4"),
+    ];
+    for (name, kind, default_value) in expected {
+        let entry = list
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap_or_else(|| panic!("settings list is missing {name}"));
+        assert_eq!(entry["kind"], kind, "{name} has the wrong kind");
+        assert_eq!(
+            entry["default_value"], default_value,
+            "{name} has the wrong default_value"
+        );
+        // extract_memories (MCP/REST) re-reads LlmExtractionConfig::from_env()
+        // on every call, so a change to either var takes effect immediately
+        // for that path — unlike the MENTISDB_DREAM_* settings, which
+        // DreamConfig caches at startup.
+        assert_eq!(entry["hot_reload"], true, "{name} should be hot-reload");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn updating_llm_base_url_persists_to_env_file_without_requiring_restart() {
+    let dir = unique_chain_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let router = dashboard_router_for_dir(&dir);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/api/settings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "settings": {
+                            "LLM_BASE_URL": "http://192.168.1.30:11434/v1",
+                            "LLM_MODEL": "llama3.1"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["success"], true);
+    assert_eq!(json["restart_required"], false);
+
+    let env_contents = std::fs::read_to_string(dir.join(".env")).unwrap();
+    assert!(env_contents.contains("LLM_BASE_URL=http://192.168.1.30:11434/v1"));
+    assert!(env_contents.contains("LLM_MODEL=llama3.1"));
+
+    std::env::remove_var("LLM_BASE_URL");
+    std::env::remove_var("LLM_MODEL");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn agent_detail_form_hydrates_values_after_dom_insertion() {
     let dir = unique_chain_dir();
     let router = dashboard_router_for_dir(&dir);

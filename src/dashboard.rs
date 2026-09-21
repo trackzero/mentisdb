@@ -3310,6 +3310,22 @@ async fn api_settings(
             kind: "string".to_string(),
             hot_reload: false,
         },
+        DashboardSetting {
+            name: "LLM_BASE_URL".to_string(),
+            value: std::env::var("LLM_BASE_URL").unwrap_or_default(),
+            default_value: "https://api.openai.com/v1".to_string(),
+            description: "OpenAI-compatible LLM API base URL, used by extract_memories and (when MENTISDB_DREAM_LLM is enabled) dreaming's LLM-assisted operations. Point this at a local Ollama instance's OpenAI-compatible endpoint, e.g. http://192.168.1.30:11434/v1, to use Ollama instead of OpenAI. Takes effect immediately for extract_memories; the dreaming scheduler caches its LLM config at startup and needs a restart to pick up a change.".to_string(),
+            kind: "string".to_string(),
+            hot_reload: true,
+        },
+        DashboardSetting {
+            name: "LLM_MODEL".to_string(),
+            value: std::env::var("LLM_MODEL").unwrap_or_default(),
+            default_value: "gpt-4".to_string(),
+            description: "Model identifier sent to the LLM_BASE_URL endpoint, e.g. gpt-4o for OpenAI or an Ollama model tag such as llama3.1. Takes effect immediately for extract_memories; the dreaming scheduler caches its LLM config at startup and needs a restart to pick up a change.".to_string(),
+            kind: "string".to_string(),
+            hot_reload: true,
+        },
     ];
     Ok(Json(settings))
 }
@@ -3378,6 +3394,8 @@ const ALLOWED_SETTING_KEYS: &[&str] = &[
     "MENTISDB_DREAM_RECOMBINATION_BUDGET",
     "MENTISDB_DREAM_WEIGHT",
     "MENTISDB_DREAM_CHAINS",
+    "LLM_BASE_URL",
+    "LLM_MODEL",
 ];
 
 /// Validate that a setting name is in the whitelist and the value does not
@@ -3442,7 +3460,9 @@ async fn api_update_settings(
             | "MENTISDB_HNSW_THRESHOLD"
             | "MENTISDB_HNSW_EF_CONSTRUCTION"
             | "MENTISDB_HNSW_EF_SEARCH"
-            | "MENTISDB_HNSW_BACKGROUND_BUILD" => {
+            | "MENTISDB_HNSW_BACKGROUND_BUILD"
+            | "LLM_BASE_URL"
+            | "LLM_MODEL" => {
                 // These are read from env on demand
             }
             _ => {

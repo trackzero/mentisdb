@@ -1,4 +1,12 @@
 0.10.8.54 SEP/18/2026 (feature/dreaming, Phase 0+1+2+3 — not yet released)
+  - feat(dashboard): expose `LLM_BASE_URL` and `LLM_MODEL` on the Settings
+    page (`OPENAI_API_KEY` stays `.env`-only). Both are `hot_reload: true`:
+    `extract_memories` (MCP/REST) re-reads `LlmExtractionConfig::from_env()`
+    on every call, so a change takes effect immediately for that path — the
+    dreaming scheduler still caches its LLM config at startup and needs a
+    restart, same as every other `MENTISDB_DREAM_*` setting. Lets an
+    OpenAI-compatible endpoint (e.g. a local Ollama instance) be configured
+    without hand-editing `.env`.
   - fix(cli): `mentisdb dream [--chain <key>] [--dry-run] [--phase <phase,...>]`
     and `mentisdb dream promote|dismiss <dream_id>` were fully implemented
     (`src/cli/args.rs::parse_dream`) and documented, but the top-level
