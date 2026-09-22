@@ -1,4 +1,15 @@
 0.10.8.54 SEP/18/2026 (feature/dreaming, Phase 0+1+2+3 — not yet released)
+  - feat(dashboard): wire up pagination on the Dreams tab. The
+    `GET /dashboard/api/chains/:key/dreams` endpoint already supported
+    `page`/`per_page` (default 20/page), but `loadDreamsForChain` never
+    requested past page 1 and had no Prev/Next controls -- a chain with
+    more than 20 dream passes had its older passes silently unreachable
+    from the UI (still on disk, just not shown). Added a Prev/Next pager
+    per chain section (`dreamsPagerHtml`, matching the existing Explorer
+    tab's `ex-prev`/`ex-next` pattern) and a `page` parameter threaded
+    through `loadDreamsForChain`. The "Hide empty passes" toggle filters
+    within whatever page is currently loaded, same as before; the pager's
+    page count reflects the full unfiltered set for the chain.
   - feat(dashboard): dream passes that wrote zero output thoughts (a
     watermark-only pass, common on an active idle scheduler) rendered as a
     full bundle-card with a "No output thoughts recorded for this pass."

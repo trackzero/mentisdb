@@ -2920,26 +2920,52 @@
     `;
   }
 
-  function loadDreamsForChain(chainKey, bodyEl) {
-    api(`/dashboard/api/chains/${encodeURIComponent(chainKey)}/dreams`)
+  function dreamsPagerHtml(chainKey, page, pages, total) {
+    if (pages <= 1) return '';
+    return `
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+        <button class="btn btn-secondary btn-sm" id="dream-prev-${esc(chainKey)}" ${page<=1?'disabled':''}>← Prev</button>
+        <span class="pagination-info">Page ${page} of ${pages} &nbsp;·&nbsp; ${total.toLocaleString()} pass${total!==1?'es':''}</span>
+        <button class="btn btn-secondary btn-sm" id="dream-next-${esc(chainKey)}" ${page>=pages?'disabled':''}>Next →</button>
+      </div>
+    `;
+  }
+
+  function loadDreamsForChain(chainKey, bodyEl, page = 1) {
+    api(`/dashboard/api/chains/${encodeURIComponent(chainKey)}/dreams?page=${page}&per_page=20`)
       .then(data => {
         const passes = Array.isArray(data.passes) ? data.passes : [];
-        if (!passes.length) {
+        const total = data.total || 0;
+        const pages = Math.max(1, data.pages || 1);
+        if (!total) {
           bodyEl.innerHTML = '<div class="empty-state">No dream passes yet for this chain.</div>';
           return;
         }
+        const pagerHtml = dreamsPagerHtml(chainKey, page, pages, total);
         const hideEmpty = dreamsHideEmpty();
         const visiblePasses = hideEmpty
           ? passes.filter(p => (Array.isArray(p.outputs) ? p.outputs : []).length > 0)
           : passes;
         if (!visiblePasses.length) {
-          bodyEl.innerHTML = `<div class="empty-state">All ${passes.length} pass(es) for this chain produced no output (hidden — toggle "Hide empty passes" off to see them).</div>`;
-          return;
+          bodyEl.innerHTML = `
+            ${pagerHtml}
+            <div class="empty-state">All ${passes.length} pass(es) on this page produced no output (hidden — toggle "Hide empty passes" off, or go to another page, to see them).</div>
+          `;
+        } else {
+          bodyEl.innerHTML = `
+            ${pagerHtml}
+            <div style="margin-bottom:10px">${dreamChartSvg(visiblePasses)}</div>
+            <div class="bundle-stack">${visiblePasses.map(p => dreamPassCardHtml(chainKey, p)).join('')}</div>
+          `;
         }
-        bodyEl.innerHTML = `
-          <div style="margin-bottom:10px">${dreamChartSvg(visiblePasses)}</div>
-          <div class="bundle-stack">${visiblePasses.map(p => dreamPassCardHtml(chainKey, p)).join('')}</div>
-        `;
+        document.getElementById(`dream-prev-${esc(chainKey)}`)?.addEventListener('click', () => {
+          loadDreamsForChain(chainKey, bodyEl, page - 1);
+          bodyEl.scrollIntoView({ behavior: 'auto', block: 'start' });
+        });
+        document.getElementById(`dream-next-${esc(chainKey)}`)?.addEventListener('click', () => {
+          loadDreamsForChain(chainKey, bodyEl, page + 1);
+          bodyEl.scrollIntoView({ behavior: 'auto', block: 'start' });
+        });
         bodyEl.querySelectorAll('.bundle-support-item.clickable').forEach(rowEl => {
           rowEl.addEventListener('click', (evt) => {
             if (evt.target.closest('button, textarea, input')) return;

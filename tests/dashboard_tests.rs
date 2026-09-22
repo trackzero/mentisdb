@@ -2046,6 +2046,17 @@ async fn dashboard_html_renders_empty_dream_passes_as_slim_rows_with_hide_toggle
         "const visiblePasses = hideEmpty\n          ? passes.filter(p => (Array.isArray(p.outputs) ? p.outputs : []).length > 0)\n          : passes;"
     ));
 
+    // Regression test: loadDreamsForChain never requested past page 1, and
+    // had no Prev/Next controls, so a chain with more than the backend's
+    // default 20-passes-per-page silently had its older passes unreachable
+    // from the Dreams tab even though the /dreams endpoint already
+    // supported page/per_page. Confirm the pager is now wired through.
+    assert!(html.contains("function loadDreamsForChain(chainKey, bodyEl, page = 1)"));
+    assert!(html.contains("/dreams?page=${page}&per_page=20"));
+    assert!(html.contains("function dreamsPagerHtml(chainKey, page, pages, total)"));
+    assert!(html.contains("id=\"dream-prev-${esc(chainKey)}\""));
+    assert!(html.contains("id=\"dream-next-${esc(chainKey)}\""));
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2462,6 +2473,88 @@ async fn dreams_endpoint_groups_report_and_outputs_by_pass() {
     assert_eq!(outputs.len(), 1, "one consolidation summary expected");
     assert_eq!(outputs[0]["status"], "pending");
     assert_eq!(outputs[0]["role"], "Dream");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn dreams_endpoint_paginates_passes_newest_first() {
+    // Regression test for the dashboard's dream-passes pager: with more
+    // passes than fit on one page, `page`/`per_page` must slice correctly
+    // and `pages`/`total` must reflect the full set, not just the page
+    // returned. run_dream_pass (unlike the idle scheduler) ignores
+    // idle/interval gating, so calling it repeatedly with nothing new to
+    // scan produces one report per call, each still watermark-advancing.
+    let dir = unique_chain_dir();
+    let chain_key = "dreams-paginated";
+    let mut chain =
+        MentisDb::open_with_key_and_storage_kind(&dir, chain_key, StorageAdapterKind::Binary)
+            .unwrap();
+    let mut pass_ids = Vec::new();
+    for _ in 0..3 {
+        let report = mentisdb::dream::run_dream_pass(
+            &mut chain,
+            &mentisdb::dream::DreamConfig::default(),
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+        pass_ids.push(report.pass_id.to_string());
+    }
+    drop(chain);
+
+    let router = dashboard_router_for_dir(&dir);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/dashboard/api/chains/{chain_key}/dreams?page=1&per_page=2"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = dashboard_body_json(response).await;
+    assert_eq!(json["total"], 3);
+    assert_eq!(json["pages"], 2);
+    assert_eq!(json["page"], 1);
+    let page1 = json["passes"].as_array().unwrap();
+    assert_eq!(page1.len(), 2, "first page should hold per_page passes");
+    // Newest-first: the 3rd (last) pass run should lead page 1.
+    assert_eq!(
+        page1[0]["report"]["pass_id"],
+        Value::String(pass_ids[2].clone())
+    );
+    assert_eq!(
+        page1[1]["report"]["pass_id"],
+        Value::String(pass_ids[1].clone())
+    );
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/dashboard/api/chains/{chain_key}/dreams?page=2&per_page=2"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = dashboard_body_json(response).await;
+    let page2 = json["passes"].as_array().unwrap();
+    assert_eq!(page2.len(), 1, "second page should hold the remainder");
+    assert_eq!(
+        page2[0]["report"]["pass_id"],
+        Value::String(pass_ids[0].clone())
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
