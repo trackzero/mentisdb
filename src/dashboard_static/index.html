@@ -2867,10 +2867,40 @@
     `;
   }
 
+  const DREAMS_HIDE_EMPTY_KEY = 'mentisdb.dreams.hide-empty';
+
+  function dreamsHideEmpty() {
+    try {
+      return localStorage.getItem(DREAMS_HIDE_EMPTY_KEY) === '1';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function setDreamsHideEmpty(hide) {
+    try {
+      localStorage.setItem(DREAMS_HIDE_EMPTY_KEY, hide ? '1' : '0');
+    } catch (_) {}
+  }
+
+  function dreamEmptyPassRowHtml(pass) {
+    const r = pass.report || {};
+    const passIdShort = esc(String(r.pass_id || '').slice(0, 8));
+    return `
+      <div class="bundle-support-item" style="opacity:0.7;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">
+        <span class="mono" style="font-size:0.82rem">Pass ${passIdShort}${r.dry_run ? ' <span class="badge badge-gray">dry-run</span>' : ''}</span>
+        <span style="color:#8b949e;font-size:0.82rem">${esc(fmtDate(r.started_at))} · 0 outputs · ${esc(String(r.duration_ms||0))} ms</span>
+      </div>
+    `;
+  }
+
   function dreamPassCardHtml(chainKey, pass) {
     const r = pass.report || {};
     const c = r.counts || {};
     const outputs = Array.isArray(pass.outputs) ? pass.outputs : [];
+    if (!outputs.length) {
+      return dreamEmptyPassRowHtml(pass);
+    }
     const passIdShort = esc(String(r.pass_id || '').slice(0, 8));
     return `
       <div class="bundle-card">
@@ -2884,7 +2914,7 @@
           <span class="badge badge-gray">${esc(String(r.duration_ms||0))} ms</span>
         </div>
         <div class="bundle-support-list">
-          ${outputs.length ? outputs.map(o => dreamOutputRowHtml(chainKey, o)).join('') : '<div class="empty-state" style="padding:16px">No output thoughts recorded for this pass.</div>'}
+          ${outputs.map(o => dreamOutputRowHtml(chainKey, o)).join('')}
         </div>
       </div>
     `;
@@ -2898,15 +2928,23 @@
           bodyEl.innerHTML = '<div class="empty-state">No dream passes yet for this chain.</div>';
           return;
         }
+        const hideEmpty = dreamsHideEmpty();
+        const visiblePasses = hideEmpty
+          ? passes.filter(p => (Array.isArray(p.outputs) ? p.outputs : []).length > 0)
+          : passes;
+        if (!visiblePasses.length) {
+          bodyEl.innerHTML = `<div class="empty-state">All ${passes.length} pass(es) for this chain produced no output (hidden — toggle "Hide empty passes" off to see them).</div>`;
+          return;
+        }
         bodyEl.innerHTML = `
-          <div style="margin-bottom:10px">${dreamChartSvg(passes)}</div>
-          <div class="bundle-stack">${passes.map(p => dreamPassCardHtml(chainKey, p)).join('')}</div>
+          <div style="margin-bottom:10px">${dreamChartSvg(visiblePasses)}</div>
+          <div class="bundle-stack">${visiblePasses.map(p => dreamPassCardHtml(chainKey, p)).join('')}</div>
         `;
         bodyEl.querySelectorAll('.bundle-support-item.clickable').forEach(rowEl => {
           rowEl.addEventListener('click', (evt) => {
             if (evt.target.closest('button, textarea, input')) return;
             const id = rowEl.getAttribute('data-dream-output-id');
-            const output = passes.flatMap(p => p.outputs || []).find(o => o.id === id);
+            const output = visiblePasses.flatMap(p => p.outputs || []).find(o => o.id === id);
             if (output) openModal(output, chainKey);
           });
         });
@@ -2917,9 +2955,19 @@
   function renderDreams(targetChainKey = null) {
     const app = document.getElementById('app');
     app.innerHTML = `
-      <div class="page-header"><h1 title="Dream-pass output awaiting review: consolidations, dedup suggestions, LLM recombinations, and contradiction suggestions">Dreams</h1></div>
+      <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+        <h1 title="Dream-pass output awaiting review: consolidations, dedup suggestions, LLM recombinations, and contradiction suggestions">Dreams</h1>
+        <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:#8b949e;cursor:pointer">
+          <input type="checkbox" id="dreams-hide-empty-toggle" ${dreamsHideEmpty() ? 'checked' : ''}>
+          Hide empty passes
+        </label>
+      </div>
       <div id="dreams-body"></div>
     `;
+    document.getElementById('dreams-hide-empty-toggle').addEventListener('change', (evt) => {
+      setDreamsHideEmpty(evt.target.checked);
+      renderDreams(targetChainKey);
+    });
     const el = document.getElementById('dreams-body');
     spinner(el);
 

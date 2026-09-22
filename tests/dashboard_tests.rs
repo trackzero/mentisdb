@@ -2007,6 +2007,49 @@ async fn dashboard_html_includes_chain_search_scaffolding() {
 }
 
 #[tokio::test]
+async fn dashboard_html_renders_empty_dream_passes_as_slim_rows_with_hide_toggle() {
+    // Regression test: dream passes that wrote zero output thoughts (a
+    // watermark-only pass, common on an active idle scheduler) used to get
+    // the exact same full bundle-card treatment as a pass with real output,
+    // including a "No output thoughts recorded for this pass." empty-state
+    // block. On a chain with a long dream-pass history this drowns out the
+    // passes that actually produced something. Empty passes now render as a
+    // compact one-line row (dreamEmptyPassRowHtml), and the Dreams page has
+    // a "Hide empty passes" toggle (persisted to localStorage) that filters
+    // them out of both the pass list and the chart entirely.
+    let dir = unique_chain_dir();
+    let router = dashboard_router_for_dir(&dir);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8(body.to_vec())
+        .unwrap()
+        .replace("\r\n", "\n");
+
+    assert!(!html.contains("No output thoughts recorded for this pass."));
+    assert!(html.contains("function dreamEmptyPassRowHtml(pass)"));
+    assert!(html.contains("if (!outputs.length) {\n      return dreamEmptyPassRowHtml(pass);\n    }"));
+    assert!(html.contains("id=\"dreams-hide-empty-toggle\""));
+    assert!(html.contains("mentisdb.dreams.hide-empty"));
+    assert!(html.contains(
+        "const visiblePasses = hideEmpty\n          ? passes.filter(p => (Array.isArray(p.outputs) ? p.outputs : []).length > 0)\n          : passes;"
+    ));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn dashboard_bearer_token_access_uses_radio_group_with_status_pill() {
     // Regression test for the previous single-checkbox UI: the new
     // "MCP Access Control" card on the Bearer Tokens page must expose two

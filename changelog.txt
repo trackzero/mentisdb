@@ -1,4 +1,14 @@
 0.10.8.54 SEP/18/2026 (feature/dreaming, Phase 0+1+2+3 — not yet released)
+  - feat(dashboard): dream passes that wrote zero output thoughts (a
+    watermark-only pass, common on an active idle scheduler) rendered as a
+    full bundle-card with a "No output thoughts recorded for this pass."
+    empty-state block, indistinguishable in size from a pass that actually
+    produced something -- on a chain with a long dream-pass history this
+    drowns out the passes that matter. Empty passes now render as a compact
+    one-line row instead, and the Dreams page has a "Hide empty passes"
+    toggle (persisted to `localStorage`) that filters them out of both the
+    pass list and the chart entirely. Nothing is deleted -- storage stays
+    append-only -- this is a display-only change.
   - fix(llm): `chat_completion` (shared by `extract_memories` and dreaming's
     LLM-assisted operations) had no request timeout. `openai-rust2` has no
     retry or timeout logic of its own (verified against its source -- the
